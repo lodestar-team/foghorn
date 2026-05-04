@@ -148,7 +148,16 @@ identifier. The recovered address changes when an indexer closes and reopens an 
 
 ---
 
+## Disclaimer
+
+Foghorn is an independent open-source project by the [Lodestar](https://lodestar-dashboard.com)
+team. It is **not affiliated with, endorsed by, or associated with The Graph Foundation,
+Edge & Node, or any other core Graph Protocol organisation.** It consumes The Graph's
+public gateway and network subgraph as any third-party application would.
+
+---
+
 ## RFC
 
-Based on the Foghorn RFC v0.3 (internal, The Graph Foundation). M1–M3 implemented.
-M4 (TAP direct probing) pending.
+Based on the Foghorn RFC v0.3 (community design doc, not an official Foundation document).
+M1–M3 implemented. M4 (TAP direct probing) pending.
