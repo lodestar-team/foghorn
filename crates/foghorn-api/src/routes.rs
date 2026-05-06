@@ -376,6 +376,49 @@ pub async fn indexer_freshness(
     })))
 }
 
+// ── Deployments list ─────────────────────────────────────────────────────────
+
+pub async fn deployments(State(state): State<AppState>) -> Result<Json<Value>, StatusCode> {
+    let rows = sqlx::query(
+        r#"SELECT
+             p.deployment_id,
+             COUNT(DISTINCT p.id) as total_probes,
+             ROUND(AVG(CASE WHEN o.response_hash IS NOT NULL THEN o.latency_ms END))::int as avg_latency_ms,
+             PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY CASE WHEN o.response_hash IS NOT NULL THEN o.latency_ms END) as p50_latency_ms,
+             PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY CASE WHEN o.response_hash IS NOT NULL THEN o.latency_ms END) as p95_latency_ms,
+             MAX(p.dispatched_at) as last_probe_at,
+             COUNT(DISTINCT CASE WHEN o.response_hash IS NOT NULL THEN o.indexer_address END) as unique_indexers
+           FROM probe p
+           LEFT JOIN observation o ON o.probe_id = p.id
+           WHERE p.dispatched_at > NOW() - INTERVAL '7 days'
+           GROUP BY p.deployment_id
+           ORDER BY total_probes DESC"#,
+    )
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|e| {
+        tracing::error!(error = %e, "deployments query failed");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let list: Vec<Value> = rows
+        .iter()
+        .map(|r| {
+            json!({
+                "deployment_id": r.get::<String, _>("deployment_id"),
+                "total_probes": r.get::<i64, _>("total_probes"),
+                "avg_latency_ms": r.get::<Option<i32>, _>("avg_latency_ms"),
+                "p50_latency_ms": r.get::<Option<f64>, _>("p50_latency_ms").map(|v| v.round() as i64),
+                "p95_latency_ms": r.get::<Option<f64>, _>("p95_latency_ms").map(|v| v.round() as i64),
+                "last_probe_at": r.get::<Option<chrono::DateTime<chrono::Utc>>, _>("last_probe_at"),
+                "unique_indexers": r.get::<i64, _>("unique_indexers"),
+            })
+        })
+        .collect();
+
+    Ok(Json(json!({ "deployments": list })))
+}
+
 // ── Deployment quality ───────────────────────────────────────────────────────
 
 pub async fn deployment_quality(

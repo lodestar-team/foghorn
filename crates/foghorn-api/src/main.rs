@@ -43,6 +43,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/probe/:probe_id", get(routes::probe_detail))
         .route("/v1/indexer/:address/quality", get(routes::indexer_quality))
         .route("/v1/indexer/:address/freshness", get(routes::indexer_freshness))
+        .route("/v1/deployments", get(routes::deployments))
         .route("/v1/deployment/:deployment_id/quality", get(routes::deployment_quality))
         .layer(cors)
         .with_state(state);
