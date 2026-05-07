@@ -6,6 +6,7 @@ use std::collections::HashSet;
 use tracing::{info, warn};
 
 const NETWORK_SUBGRAPH_ID: &str = "DZz4kDTdmzWLWsV373w2bSmoar3umKKH9y82SUKr5qmp";
+const NETWORK_SUBGRAPH_BASE: &str = "https://gateway-arbitrum.network.thegraph.com/api";
 
 #[derive(Deserialize)]
 struct GraphQLResponse {
@@ -33,7 +34,7 @@ struct IndexerNode {
 /// Runs after each probe round. Skips keys resolved within the last 24h (including NULL results).
 pub async fn resolve_allocation_keys(
     pool: &PgPool,
-    gateway_url: &str,
+    _gateway_url: &str,
     api_key: &str,
 ) -> Result<()> {
     let unresolved: Vec<String> = sqlx::query_scalar(
@@ -57,7 +58,7 @@ pub async fn resolve_allocation_keys(
 
     let url = format!(
         "{}/{}/subgraphs/id/{}",
-        gateway_url.trim_end_matches('/'),
+        NETWORK_SUBGRAPH_BASE,
         api_key,
         NETWORK_SUBGRAPH_ID
     );
