@@ -636,7 +636,7 @@ mod tests {
     #[test]
     fn behind_chainhead_attention() {
         let mut i = healthy();
-        i.qos_blocks_behind = Some(120_000.0); // genuinely stuck (> 50k threshold)
+        i.qos_blocks_behind = Some(1_600_000.0); // egregiously stuck (> 500k threshold)
         let out = judge(&i, &cfg());
         assert!(out.verdicts.iter().any(|v| v.kind == "behind-chainhead"));
         assert!(out.attention.iter().any(|a| a.kind == "behind-chainhead"));

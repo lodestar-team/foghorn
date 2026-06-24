@@ -52,8 +52,9 @@ async fn main() -> anyhow::Result<()> {
     // Scoring loop — grades, verdicts, attention, sybil clusters.
     {
         let scoring = config.scoring.clone();
+        let api_key = config.gateway.as_ref().map(|g| g.api_key.clone());
         let pool = pool.clone();
-        tokio::spawn(async move { scorer::run_score_loop(scoring, pool).await });
+        tokio::spawn(async move { scorer::run_score_loop(scoring, api_key, pool).await });
     }
 
     scheduler::run_probe_scheduler(config, pool).await?;

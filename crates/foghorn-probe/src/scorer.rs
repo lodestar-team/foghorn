@@ -34,10 +34,10 @@ struct Profile {
     reo_status: Option<String>,
 }
 
-pub async fn run_score_loop(cfg: ScoringConfig, pool: PgPool) {
+pub async fn run_score_loop(cfg: ScoringConfig, api_key: Option<String>, pool: PgPool) {
     info!(windows = ?cfg.windows, interval = cfg.interval_secs, "Scoring loop starting");
     loop {
-        match run_score_once(&cfg, &pool).await {
+        match run_score_once(&cfg, api_key.as_deref(), &pool).await {
             Ok(n) => info!(scored = n, "Scoring cycle complete"),
             Err(e) => warn!(error = %e, "Scoring cycle failed"),
         }
@@ -45,10 +45,10 @@ pub async fn run_score_loop(cfg: ScoringConfig, pool: PgPool) {
     }
 }
 
-pub async fn run_score_once(cfg: &ScoringConfig, pool: &PgPool) -> Result<usize> {
+pub async fn run_score_once(cfg: &ScoringConfig, api_key: Option<&str>, pool: &PgPool) -> Result<usize> {
     let run_start = Utc::now();
 
-    let sybil_map = sybil::detect_and_store(pool).await.unwrap_or_else(|e| {
+    let sybil_map = sybil::detect_and_store(pool, api_key).await.unwrap_or_else(|e| {
         warn!(error = %e, "Sybil detection failed");
         HashMap::new()
     });
