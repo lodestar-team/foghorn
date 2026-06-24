@@ -199,7 +199,20 @@ pub fn judge(i: &ScoreInputs, cfg: &ScoringConfig) -> ScoreOutcome {
             den += w;
         }
     }
-    let composite = if den > 0.0 { num / den } else { 0.0 };
+    let raw_composite = if den > 0.0 { num / den } else { 0.0 };
+
+    let sybil_flag = i
+        .sybil_confidence
+        .map(|c| c >= SYBIL_VERDICT_CONFIDENCE)
+        .unwrap_or(false);
+    // Swarm membership bites the grade: a confirmed operator-swarm member is a
+    // network-health problem regardless of how cleanly it serves data. The
+    // penalty scales with detection confidence.
+    let composite = if sybil_flag {
+        raw_composite * (1.0 - i.sybil_confidence.unwrap_or(0.0) * cfg.sybil_grade_penalty)
+    } else {
+        raw_composite
+    };
     let grade = grade_for(composite, cfg).to_string();
 
     let reasons = build_reasons(i, cfg, correctness, availability, freshness, coverage, value);
@@ -210,11 +223,6 @@ pub fn judge(i: &ScoreInputs, cfg: &ScoringConfig) -> ScoreOutcome {
         "coverage": coverage,
         "value": value,
     });
-
-    let sybil_flag = i
-        .sybil_confidence
-        .map(|c| c >= SYBIL_VERDICT_CONFIDENCE)
-        .unwrap_or(false);
 
     let score = IndexerScore {
         indexer_address: i.indexer_address.clone(),
@@ -439,19 +447,30 @@ fn derive_verdicts(i: &ScoreInputs, cfg: &ScoringConfig, composite: f64) -> Vec<
         ));
     }
 
-    // The thread's core ask: REO-eligible yet failing the quality bar.
-    let eligible = i.reo_status.as_deref() == Some("eligible");
-    let fails_bar = composite < cfg.grade_d
-        || is_serving_bad_data(i, cfg)
-        || is_serving_no_data(i, cfg)
-        || is_leech(i, cfg);
-    if eligible && fails_bar {
-        v.push(mk(
-            "reo-ineligible-candidate",
-            Severity::High,
-            "REO-eligible but failing network-quality bar".to_string(),
-            json!({ "composite": composite, "grade_d_threshold": cfg.grade_d }),
-        ));
+    // The thread's core ask: REO-eligible yet failing the quality bar. Name the
+    // actual failing condition(s) rather than just composite-vs-threshold.
+    if i.reo_status.as_deref() == Some("eligible") {
+        let mut failing: Vec<&str> = Vec::new();
+        if composite < cfg.grade_d {
+            failing.push("composite below D grade");
+        }
+        if is_serving_bad_data(i, cfg) {
+            failing.push("serving bad data");
+        }
+        if is_serving_no_data(i, cfg) {
+            failing.push("serving no data");
+        }
+        if is_leech(i, cfg) {
+            failing.push("leech (high stake, negligible queries)");
+        }
+        if !failing.is_empty() {
+            v.push(mk(
+                "reo-ineligible-candidate",
+                Severity::High,
+                format!("REO-eligible but failing: {}", failing.join(", ")),
+                json!({ "failing": failing, "composite": composite, "grade_d_threshold": cfg.grade_d }),
+            ));
+        }
     }
 
     if i.sybil_confidence.map(|c| c >= SYBIL_VERDICT_CONFIDENCE).unwrap_or(false) {
@@ -678,6 +697,9 @@ mod tests {
         let out = judge(&i, &cfg());
         assert!(out.score.sybil_flag);
         assert!(out.verdicts.iter().any(|v| v.kind == "sybil-swarm-member"));
+        // Swarm membership must bite the grade: composite drops vs the clean baseline.
+        let clean = judge(&healthy(), &cfg()).score.composite;
+        assert!(out.score.composite < clean - 20.0, "sybil should drop composite: {} vs {}", out.score.composite, clean);
 
         i.sybil_confidence = Some(0.3); // below gate
         let out = judge(&i, &cfg());

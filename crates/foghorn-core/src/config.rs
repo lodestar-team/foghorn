@@ -73,6 +73,7 @@ pub struct ScoringConfig {
     pub no_data_min_error_rate: f64, // error/timeout rate (0..1) over recent probes => serving-no-data
     pub behind_lag_blocks: i64,      // chainhead lag (blocks) considered "behind"
     pub qos_min_queries: i64,        // min QoS query volume before QoS-based verdicts apply
+    pub sybil_grade_penalty: f64,    // composite multiplier removed at full sybil confidence (0..1)
 }
 
 impl Default for ScoringConfig {
@@ -102,6 +103,8 @@ impl Default for ScoringConfig {
             // reputable operators whose average is nudged by one lagging subgraph.
             behind_lag_blocks: 50_000,
             qos_min_queries: 500,
+            // A 90%-confidence swarm member loses ~54% of its composite (e.g. A97 → ~D).
+            sybil_grade_penalty: 0.6,
         }
     }
 }
