@@ -154,6 +154,8 @@ pub struct IndexerScore {
     pub window_days: i32,
     pub composite: f64,
     pub grade: String,
+    /// False = inactive/unrated (no queries, allocations, or probes) — shown as "NR".
+    pub rated: bool,
     pub correctness_score: Option<f64>,
     pub availability_score: Option<f64>,
     pub freshness_score: Option<f64>,

@@ -517,7 +517,7 @@ pub async fn indexers(
     let asc = params.order.as_deref() == Some("asc");
 
     let sql = format!(
-        r#"SELECT s.indexer_address, s.composite, s.grade, s.correctness_score,
+        r#"SELECT s.indexer_address, s.composite, s.grade, s.rated, s.correctness_score,
                   s.availability_score, s.freshness_score, s.coverage_score, s.value_score,
                   s.sybil_flag, s.sybil_cluster_id, s.probe_count, s.reasons,
                   p.ens_name, p.self_stake_grt, p.allocation_count, p.reo_status, p.qos_query_count,
@@ -526,7 +526,7 @@ pub async fn indexers(
            FROM indexer_score s
            LEFT JOIN indexer_profile p ON p.indexer_address = s.indexer_address
            WHERE s.window_days = $1
-           ORDER BY s.composite {} NULLS LAST
+           ORDER BY s.rated DESC, s.composite {} NULLS LAST
            LIMIT $2 OFFSET $3"#,
         if asc { "ASC" } else { "DESC" }
     );
@@ -552,6 +552,7 @@ fn indexer_row_json(r: &sqlx::postgres::PgRow) -> Value {
         "ens_name": r.get::<Option<String>, _>("ens_name"),
         "composite": r.get::<f64, _>("composite"),
         "grade": r.get::<String, _>("grade"),
+        "rated": r.get::<bool, _>("rated"),
         "sub_scores": {
             "correctness": r.get::<Option<f64>, _>("correctness_score"),
             "availability": r.get::<Option<f64>, _>("availability_score"),
@@ -580,7 +581,7 @@ pub async fn indexer_scorecard(
     let address = address.to_lowercase();
 
     let scores = sqlx::query(
-        r#"SELECT window_days, composite, grade, correctness_score, availability_score,
+        r#"SELECT window_days, composite, grade, rated, correctness_score, availability_score,
                   freshness_score, coverage_score, value_score, sybil_flag, sybil_cluster_id,
                   probe_count, reasons, sub_scores, computed_at
            FROM indexer_score WHERE indexer_address = $1 ORDER BY window_days"#,
@@ -658,6 +659,7 @@ pub async fn indexer_scorecard(
             "window_days": s.get::<i32, _>("window_days"),
             "composite": s.get::<f64, _>("composite"),
             "grade": s.get::<String, _>("grade"),
+            "rated": s.get::<bool, _>("rated"),
             "sub_scores": s.get::<Value, _>("sub_scores"),
             "probe_count": s.get::<i32, _>("probe_count"),
             "sybil_flag": s.get::<bool, _>("sybil_flag"),

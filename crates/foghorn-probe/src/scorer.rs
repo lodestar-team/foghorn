@@ -214,14 +214,15 @@ async fn load_profiles(pool: &PgPool) -> Result<HashMap<String, Profile>> {
 async fn upsert_score(pool: &PgPool, s: &IndexerScore) -> Result<()> {
     sqlx::query(
         r#"INSERT INTO indexer_score
-             (indexer_address, window_days, computed_at, composite, grade,
+             (indexer_address, window_days, computed_at, composite, grade, rated,
               correctness_score, availability_score, freshness_score, coverage_score,
               value_score, sybil_flag, sybil_cluster_id, probe_count, reasons, sub_scores)
-           VALUES ($1,$2, NOW(),$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+           VALUES ($1,$2, NOW(),$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
            ON CONFLICT (indexer_address, window_days) DO UPDATE SET
              computed_at = NOW(),
              composite = EXCLUDED.composite,
              grade = EXCLUDED.grade,
+             rated = EXCLUDED.rated,
              correctness_score = EXCLUDED.correctness_score,
              availability_score = EXCLUDED.availability_score,
              freshness_score = EXCLUDED.freshness_score,
@@ -237,6 +238,7 @@ async fn upsert_score(pool: &PgPool, s: &IndexerScore) -> Result<()> {
     .bind(s.window_days)
     .bind(s.composite)
     .bind(&s.grade)
+    .bind(s.rated)
     .bind(s.correctness_score)
     .bind(s.availability_score)
     .bind(s.freshness_score)

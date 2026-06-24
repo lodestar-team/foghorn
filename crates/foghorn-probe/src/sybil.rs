@@ -16,8 +16,10 @@ use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row};
 use std::collections::HashMap;
 
-const CREATED_WINDOW_SECS: i64 = 3 * 86_400; // same operator spins identities up within days
-const STAKE_REL_TOL: f64 = 0.05; // self-stakes within 5% of each other
+const CREATED_WINDOW_SECS: i64 = 14 * 86_400; // same operator spins identities up within a fortnight
+const STAKE_REL_TOL: f64 = 0.25; // self-stakes within 25% of each other
+const HIGH_STAKE_GRT: f64 = 50_000_000.0; // anonymous nine-figure stake is itself a swarm tell
+const MIN_STAKE_GRT: f64 = 1_000_000.0; // ignore dust; swarms crowd rewards, so they stake big
 const MIN_MEMBERS: usize = 3;
 
 #[derive(Clone)]
@@ -36,7 +38,7 @@ pub async fn detect_and_store(pool: &PgPool) -> Result<HashMap<String, (String, 
            WHERE ens_name IS NULL
              AND created_at IS NOT NULL
              AND self_stake_grt IS NOT NULL
-             AND self_stake_grt > 0"#,
+             AND self_stake_grt >= 1000000"#,
     )
     .fetch_all(pool)
     .await?;
@@ -99,7 +101,11 @@ fn cluster(candidates: &[Candidate]) -> Vec<SybilCluster> {
             let close_time = (a.created_at - b.created_at).abs() <= CREATED_WINDOW_SECS;
             let similar_stake =
                 (a.stake - b.stake).abs() / a.stake.max(b.stake) <= STAKE_REL_TOL;
-            if close_time && similar_stake {
+            // Two anonymous identities created close together are "same operator"
+            // suspects if their stakes are similar OR both are nine-figure whales
+            // (anonymous + ~100M each + same-fortnight is the exact swarm pattern).
+            let both_whales = a.stake >= HIGH_STAKE_GRT && b.stake >= HIGH_STAKE_GRT;
+            if close_time && (similar_stake || both_whales) {
                 let ra = find(&mut parent, i);
                 let rb = find(&mut parent, j);
                 if ra != rb {
@@ -148,10 +154,14 @@ fn build_cluster(members: &[Candidate]) -> SybilCluster {
     } else if spread_days <= 2.0 {
         confidence += 0.1;
     }
-    if stake_rel <= 0.01 {
+    if stake_rel <= 0.03 {
         confidence += 0.2;
-    } else if stake_rel <= 0.03 {
+    } else if stake_rel <= 0.10 {
         confidence += 0.1;
+    }
+    // Anonymous nine-figure stake across the whole cluster is highly suspicious.
+    if stake_min >= HIGH_STAKE_GRT {
+        confidence += 0.2;
     }
     confidence = confidence.min(1.0);
 
@@ -197,6 +207,21 @@ mod tests {
         ];
         let clusters = cluster(&cands);
         assert_eq!(clusters.len(), 1);
+        assert_eq!(clusters[0].member_count, 3);
+        assert!(clusters[0].confidence >= 0.6, "conf={}", clusters[0].confidence);
+    }
+
+    #[test]
+    fn flags_anonymous_whale_swarm_with_stake_spread() {
+        // The real case: anonymous, created days apart, ~100-124M each (>25% would
+        // miss, but 18% spread is within tolerance and they're whales).
+        let cands = vec![
+            c("0xa", 1000, 101_000_000.0),
+            c("0xb", 1003, 123_000_000.0),
+            c("0xc", 1005, 110_000_000.0),
+        ];
+        let clusters = cluster(&cands);
+        assert_eq!(clusters.len(), 1, "{:?}", clusters);
         assert_eq!(clusters[0].member_count, 3);
         assert!(clusters[0].confidence >= 0.6, "conf={}", clusters[0].confidence);
     }

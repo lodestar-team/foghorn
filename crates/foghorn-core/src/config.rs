@@ -95,9 +95,12 @@ impl Default for ScoringConfig {
             bad_data_min_faults: 3,
             bad_data_min_rate: 0.10,
             no_data_min_error_rate: 0.50,
-            // QoS blocks-behind mixes chains; on fast chains (e.g. Arbitrum) tens of
-            // blocks is sub-minute / fresh. Set high enough to catch only genuinely-stuck.
-            behind_lag_blocks: 300,
+            // QoS blocks-behind mixes chains and is an average across all of an
+            // indexer's deployments — small absolute counts are meaningless (50
+            // Arbitrum blocks ≈ 12s). Only genuinely-stuck indexers run tens of
+            // thousands of blocks behind, so the bar is high to avoid condemning
+            // reputable operators whose average is nudged by one lagging subgraph.
+            behind_lag_blocks: 50_000,
             qos_min_queries: 500,
         }
     }

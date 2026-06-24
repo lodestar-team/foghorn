@@ -139,8 +139,44 @@ fn value_score(i: &ScoreInputs, cfg: &ScoringConfig) -> Option<f64> {
     Some(100.0 * clamp01((queries.max(0) as f64).ln_1p() / reference))
 }
 
+/// Is there enough signal to actually judge this indexer? An indexer with no
+/// query volume, no allocations, and no Foghorn probe coverage is *inactive*,
+/// not *bad* — grading it F-0 would conflate "doing nothing" with "doing harm".
+/// A high-stake idle indexer is the exception: that's a leech, and is rated.
+fn is_rated(i: &ScoreInputs, cfg: &ScoringConfig) -> bool {
+    i.qos_query_count.map(|q| q > 0).unwrap_or(false)
+        || i.probes_answered > 0
+        || i.allocation_count.map(|n| n > 0).unwrap_or(false)
+        || is_leech(i, cfg)
+}
+
 /// Compute the full judgement for one (indexer, window). Pure.
 pub fn judge(i: &ScoreInputs, cfg: &ScoringConfig) -> ScoreOutcome {
+    if !is_rated(i, cfg) {
+        // Unrated: surface as "NR", not a damning F-0, and emit no verdicts.
+        let score = IndexerScore {
+            indexer_address: i.indexer_address.clone(),
+            window_days: i.window_days,
+            composite: 0.0,
+            grade: "NR".to_string(),
+            rated: false,
+            correctness_score: None,
+            availability_score: None,
+            freshness_score: None,
+            coverage_score: None,
+            value_score: None,
+            sybil_flag: false,
+            sybil_cluster_id: None,
+            probe_count: 0,
+            reasons: vec!["inactive — no queries, allocations, or probe coverage".to_string()],
+            sub_scores: json!({
+                "correctness": null, "availability": null, "freshness": null,
+                "coverage": null, "value": null
+            }),
+        };
+        return ScoreOutcome { score, verdicts: vec![], attention: vec![] };
+    }
+
     let correctness = correctness_score(i);
     let availability = availability_score(i);
     let freshness = freshness_score(i, cfg);
@@ -185,6 +221,7 @@ pub fn judge(i: &ScoreInputs, cfg: &ScoringConfig) -> ScoreOutcome {
         window_days: i.window_days,
         composite,
         grade,
+        rated: true,
         correctness_score: correctness,
         availability_score: availability,
         freshness_score: freshness,
@@ -580,11 +617,47 @@ mod tests {
     #[test]
     fn behind_chainhead_attention() {
         let mut i = healthy();
-        i.qos_blocks_behind = Some(500.0);
+        i.qos_blocks_behind = Some(120_000.0); // genuinely stuck (> 50k threshold)
         let out = judge(&i, &cfg());
         assert!(out.verdicts.iter().any(|v| v.kind == "behind-chainhead"));
         assert!(out.attention.iter().any(|a| a.kind == "behind-chainhead"));
         assert!(out.score.freshness_score.unwrap() < 50.0);
+    }
+
+    #[test]
+    fn moderate_lag_does_not_flag_behind() {
+        let mut i = healthy();
+        i.qos_blocks_behind = Some(6_000.0); // fast-chain noise, not stuck
+        let out = judge(&i, &cfg());
+        assert!(!out.verdicts.iter().any(|v| v.kind == "behind-chainhead"));
+    }
+
+    #[test]
+    fn inactive_indexer_is_unrated_not_f() {
+        let i = ScoreInputs {
+            indexer_address: "0xidle".to_string(),
+            window_days: 7,
+            ..Default::default()
+        };
+        let out = judge(&i, &cfg());
+        assert!(!out.score.rated);
+        assert_eq!(out.score.grade, "NR");
+        assert!(out.verdicts.is_empty());
+        assert!(out.attention.is_empty());
+    }
+
+    #[test]
+    fn high_stake_idle_is_rated_leech() {
+        let i = ScoreInputs {
+            indexer_address: "0xleech".to_string(),
+            window_days: 7,
+            self_stake_grt: Some(5_000_000.0),
+            qos_query_count: Some(0),
+            ..Default::default()
+        };
+        let out = judge(&i, &cfg());
+        assert!(out.score.rated);
+        assert!(out.verdicts.iter().any(|v| v.kind == "leech"));
     }
 
     #[test]
