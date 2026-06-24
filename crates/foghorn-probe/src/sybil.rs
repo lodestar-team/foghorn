@@ -261,26 +261,30 @@ fn build_cluster(members: &[Candidate]) -> SybilCluster {
         0.0
     };
 
-    let mut confidence = 0.5;
-    confidence += ((members.len() as f64 - MIN_MEMBERS as f64) * 0.05).min(0.2);
+    // Confidence reflects how many INDEPENDENT signals corroborate "one operator",
+    // and how tightly. A cluster held together only by co-allocation (loose
+    // creation/stake) lands moderate, not high — co-allocation is suggestive, not
+    // proof. Cluster size deliberately does NOT inflate confidence: a bigger
+    // loosely-linked group is not more certain, it's more diluted.
+    let overlap = mean_overlap(members);
+    let mut confidence: f64 = 0.4;
     if spread_days <= 1.0 {
-        confidence += 0.2;
-    } else if spread_days <= 2.0 {
+        confidence += 0.25; // born within a day of each other
+    } else if spread_days <= 3.0 {
         confidence += 0.1;
     }
     if stake_rel <= 0.03 {
-        confidence += 0.2;
+        confidence += 0.2; // near-identical self-stake
     } else if stake_rel <= 0.10 {
         confidence += 0.1;
+    } else if stake_rel <= 0.25 {
+        confidence += 0.05;
     }
-    // Anonymous nine-figure stake across the whole cluster is highly suspicious.
     if stake_min >= HIGH_STAKE_GRT {
-        confidence += 0.2;
+        confidence += 0.15; // every member is an anonymous nine-figure whale
     }
-    // Crowding the same subgraphs is strong corroboration the identities are one operator.
-    let overlap = mean_overlap(members);
     if overlap >= CROWD_OVERLAP {
-        confidence += 0.2;
+        confidence += 0.2; // crowd the same subgraphs
     } else if overlap >= 0.5 {
         confidence += 0.1;
     }
