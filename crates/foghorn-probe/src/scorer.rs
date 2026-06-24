@@ -272,34 +272,67 @@ const PER_DEPLOYMENT_LAG_MARGIN: f64 = 50_000.0;
 ///     deployment (allocation-scoped, so syncing-not-allocated indexers don't
 ///     false-positive, and same-deployment = same-chain so blocks compare).
 /// Both are needs-attention items (fixable per-deployment issues), not grade hits.
+/// When an indexer has this many affected deployments, roll them into a single
+/// indexer-level item (it's an indexer-wide outage, not N subgraph issues).
+const ROLLUP_THRESHOLD: usize = 5;
+
 async fn detect_allocation_issues(pool: &PgPool) -> Result<usize> {
     let mut n = 0usize;
 
-    // 1. Serving errors on a specific deployment.
+    // 1. Serving errors on specific deployments (low success, real volume).
     let errs = sqlx::query(
         r#"SELECT indexer_address, deployment_id, success_rate, query_count
            FROM allocation_qos
-           WHERE query_count >= 100 AND success_rate < 0.5"#,
+           WHERE query_count >= 100 AND success_rate < 0.5
+           ORDER BY indexer_address, query_count DESC"#,
     )
     .fetch_all(pool)
     .await?;
+    let mut by_indexer: HashMap<String, Vec<(String, f64, i64)>> = HashMap::new();
     for row in &errs {
-        let sr: f64 = row.get("success_rate");
-        let qc: i64 = row.get("query_count");
-        let item = AttentionItem {
-            indexer_address: row.get("indexer_address"),
-            kind: "serving-errors-deployment".to_string(),
-            deployment_id: row.get("deployment_id"),
-            severity: Severity::Critical,
-            urgency: 95.0 + (1.0 - sr) * 5.0,
-            title: format!("Serving errors on a deployment ({:.0}% success over {} queries)", sr * 100.0, qc),
-            detail: serde_json::json!({ "success_rate": sr, "query_count": qc }),
-        };
-        upsert_attention(pool, &item).await?;
-        n += 1;
+        by_indexer
+            .entry(row.get("indexer_address"))
+            .or_default()
+            .push((row.get("deployment_id"), row.get("success_rate"), row.get("query_count")));
+    }
+    for (indexer, deps) in by_indexer {
+        if deps.len() >= ROLLUP_THRESHOLD {
+            // Indexer-wide outage → one item.
+            let total_q: i64 = deps.iter().map(|(_, _, q)| q).sum();
+            let examples: Vec<&str> = deps.iter().take(3).map(|(d, _, _)| d.as_str()).collect();
+            let item = AttentionItem {
+                indexer_address: indexer,
+                kind: "serving-errors".to_string(),
+                deployment_id: String::new(),
+                severity: Severity::Critical,
+                urgency: 100.0 + (deps.len() as f64).min(50.0),
+                title: format!("Serving errors across {} deployments (indexer-wide)", deps.len()),
+                detail: serde_json::json!({
+                    "deployment_count": deps.len(),
+                    "total_queries": total_q,
+                    "examples": examples,
+                }),
+            };
+            upsert_attention(pool, &item).await?;
+            n += 1;
+        } else {
+            for (dep, sr, qc) in &deps {
+                let item = AttentionItem {
+                    indexer_address: indexer.clone(),
+                    kind: "serving-errors-deployment".to_string(),
+                    deployment_id: dep.clone(),
+                    severity: Severity::Critical,
+                    urgency: 95.0 + (1.0 - sr) * 5.0,
+                    title: format!("Serving errors on a deployment ({:.0}% success over {} queries)", sr * 100.0, qc),
+                    detail: serde_json::json!({ "success_rate": sr, "query_count": qc }),
+                };
+                upsert_attention(pool, &item).await?;
+                n += 1;
+            }
+        }
     }
 
-    // 2. Behind the freshest serving peer on a deployment.
+    // 2. Behind the freshest serving peer on specific deployments.
     let lags = sqlx::query(
         r#"WITH baseline AS (
                SELECT deployment_id, MIN(blocks_behind) AS floor, COUNT(*) AS peers
@@ -310,26 +343,49 @@ async fn detect_allocation_issues(pool: &PgPool) -> Result<usize> {
            JOIN baseline b ON b.deployment_id = a.deployment_id
            WHERE b.peers >= 3
              AND a.blocks_behind > b.floor + $1
-             AND a.blocks_behind > $1"#,
+             AND a.blocks_behind > $1
+           ORDER BY a.indexer_address, a.blocks_behind DESC"#,
     )
     .bind(PER_DEPLOYMENT_LAG_MARGIN)
     .fetch_all(pool)
     .await?;
+    let mut lag_by_indexer: HashMap<String, Vec<(String, f64, f64)>> = HashMap::new();
     for row in &lags {
-        let bb: f64 = row.get("blocks_behind");
-        let floor: f64 = row.get("floor");
-        let peers: i64 = row.get("peers");
-        let item = AttentionItem {
-            indexer_address: row.get("indexer_address"),
-            kind: "behind-deployment".to_string(),
-            deployment_id: row.get("deployment_id"),
-            severity: Severity::High,
-            urgency: 60.0 + (bb / 100_000.0).min(35.0),
-            title: format!("Behind on a deployment (~{:.0} blocks; freshest serving peer at {:.0})", bb, floor),
-            detail: serde_json::json!({ "blocks_behind": bb, "peer_floor": floor, "peers": peers }),
-        };
-        upsert_attention(pool, &item).await?;
-        n += 1;
+        lag_by_indexer
+            .entry(row.get("indexer_address"))
+            .or_default()
+            .push((row.get("deployment_id"), row.get("blocks_behind"), row.get("floor")));
+    }
+    for (indexer, deps) in lag_by_indexer {
+        if deps.len() >= ROLLUP_THRESHOLD {
+            let worst = deps.iter().map(|(_, b, _)| *b).fold(0.0_f64, f64::max);
+            let examples: Vec<&str> = deps.iter().take(3).map(|(d, _, _)| d.as_str()).collect();
+            let item = AttentionItem {
+                indexer_address: indexer,
+                kind: "behind-deployments".to_string(),
+                deployment_id: String::new(),
+                severity: Severity::High,
+                urgency: 65.0 + (deps.len() as f64).min(30.0),
+                title: format!("Behind on {} deployments (worst ~{:.0} blocks)", deps.len(), worst),
+                detail: serde_json::json!({ "deployment_count": deps.len(), "worst_blocks_behind": worst, "examples": examples }),
+            };
+            upsert_attention(pool, &item).await?;
+            n += 1;
+        } else {
+            for (dep, bb, floor) in &deps {
+                let item = AttentionItem {
+                    indexer_address: indexer.clone(),
+                    kind: "behind-deployment".to_string(),
+                    deployment_id: dep.clone(),
+                    severity: Severity::High,
+                    urgency: 60.0 + (bb / 100_000.0).min(35.0),
+                    title: format!("Behind on a deployment (~{:.0} blocks; freshest serving peer at {:.0})", bb, floor),
+                    detail: serde_json::json!({ "blocks_behind": bb, "peer_floor": floor }),
+                };
+                upsert_attention(pool, &item).await?;
+                n += 1;
+            }
+        }
     }
     Ok(n)
 }
