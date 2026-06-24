@@ -107,6 +107,15 @@ pub async fn detect_and_store(pool: &PgPool, api_key: Option<&str>) -> Result<Ha
         .execute(pool)
         .await?;
     }
+
+    // Drop stale clusters from earlier runs — a membership change yields a new
+    // cluster_id, so the old row would otherwise linger and double-count.
+    let current_ids: Vec<String> = clusters.iter().map(|c| c.cluster_id.clone()).collect();
+    sqlx::query("DELETE FROM sybil_cluster WHERE cluster_id <> ALL($1)")
+        .bind(&current_ids)
+        .execute(pool)
+        .await?;
+
     Ok(map)
 }
 
