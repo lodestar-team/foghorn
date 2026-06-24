@@ -19,7 +19,7 @@ const QOS_CONCURRENCY: usize = 6;
 // QoS oracle (Edge & Node) — per-allocation (indexer × deployment) daily metrics.
 const QOS_ORACLE_ID: &str = "Dtr9rETvwokot4BSXaD5tECanXfqfJKcvHuaaEgPDD2D";
 const QOS_ORACLE_BASE: &str = "https://gateway-arbitrum.network.thegraph.com/api";
-const ALLOC_MIN_QUERIES: i64 = 50; // ignore negligible-traffic allocations
+const ALLOC_MIN_QUERIES: i64 = 10; // ignore only near-zero-traffic allocations
 
 pub async fn run_ingest_loop(cfg: LodestarConfig, api_key: Option<String>, pool: PgPool) {
     info!(base_url = %cfg.base_url, interval = cfg.ingest_interval_secs, "Lodestar ingest loop starting");
