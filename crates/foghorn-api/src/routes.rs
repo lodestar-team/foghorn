@@ -812,6 +812,33 @@ pub async fn verdicts(
     Ok(Json(json!({ "verdicts": items, "count": items.len() })))
 }
 
+/// Per-indexer query success/lag for a single deployment (from the oracle's
+/// allocation QoS) — so a subgraph page can show who's *serving* it, not just
+/// who's synced. Catches "synced but 400ing on this subgraph".
+pub async fn deployment_qos(
+    State(state): State<AppState>,
+    Path(deployment_id): Path<String>,
+) -> Result<Json<Value>, StatusCode> {
+    let rows = sqlx::query(
+        r#"SELECT indexer_address, success_rate, blocks_behind, query_count
+           FROM allocation_qos WHERE deployment_id = $1
+           ORDER BY query_count DESC"#,
+    )
+    .bind(&deployment_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let indexers: Vec<Value> = rows.iter().map(|r| json!({
+        "indexer_address": r.get::<String, _>("indexer_address"),
+        "success_rate": r.get::<Option<f64>, _>("success_rate"),
+        "blocks_behind": r.get::<Option<f64>, _>("blocks_behind"),
+        "query_count": r.get::<Option<i64>, _>("query_count"),
+    })).collect();
+
+    Ok(Json(json!({ "deployment_id": deployment_id, "indexers": indexers })))
+}
+
 /// Deployments flagged as non-deterministic (diverge every round — subgraph's fault).
 pub async fn nondeterministic(State(state): State<AppState>) -> Result<Json<Value>, StatusCode> {
     let rows = sqlx::query(
