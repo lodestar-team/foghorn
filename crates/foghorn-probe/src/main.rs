@@ -37,7 +37,8 @@ async fn main() -> anyhow::Result<()> {
     // Lodestar ingest loop — roster / QoS / REO into indexer_profile.
     if let Some(lodestar) = config.lodestar.clone() {
         let pool = pool.clone();
-        tokio::spawn(async move { ingest::run_ingest_loop(lodestar, pool).await });
+        let api_key = config.gateway.as_ref().map(|g| g.api_key.clone());
+        tokio::spawn(async move { ingest::run_ingest_loop(lodestar, api_key, pool).await });
     } else {
         info!("No [lodestar] config — roster/QoS ingest disabled");
     }

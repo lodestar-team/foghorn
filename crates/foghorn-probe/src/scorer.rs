@@ -93,11 +93,12 @@ pub async fn run_score_once(cfg: &ScoringConfig, api_key: Option<&str>, pool: &P
         }
     }
 
-    // Per-deployment laggards from direct /status data — catches an indexer that
-    // is stale on ONE subgraph (invisible to the cross-chain QoS average).
-    match detect_deployment_laggards(pool).await {
-        Ok(n) => info!(laggards = n, "Per-deployment lag check complete"),
-        Err(e) => warn!(error = %e, "Per-deployment lag check failed"),
+    // Per-(indexer, deployment) issues from the oracle's allocation QoS — catches
+    // "synced but serving errors on subgraph X" and genuine per-deployment lag,
+    // allocation-scoped (never flags an indexer merely syncing a deployment).
+    match detect_allocation_issues(pool).await {
+        Ok(n) => info!(items = n, "Per-deployment QoS check complete"),
+        Err(e) => warn!(error = %e, "Per-deployment QoS check failed"),
     }
 
     // Drop verdicts/attention not re-emitted this run (condition cleared).
@@ -260,64 +261,72 @@ async fn detect_nondeterministic(pool: &PgPool) -> Result<()> {
     Ok(())
 }
 
-/// Per-deployment lag margin (blocks) an indexer may trail the freshest peer
-/// before it's flagged "behind on this deployment".
-const PER_DEPLOYMENT_LAG_MARGIN: i64 = 50_000;
+/// Per-deployment lag margin (blocks) an indexer may trail the freshest serving
+/// peer before it's flagged "behind on this deployment".
+const PER_DEPLOYMENT_LAG_MARGIN: f64 = 50_000.0;
 
-/// Flag indexers that are stale on a SPECIFIC deployment, peer-relative: compared
-/// against the freshest indexer serving the same deployment (same chain → blocks
-/// are comparable; relative → no false positives when the whole subgraph is slow
-/// or still syncing). This is the "your indexer is lagging on subgraph X" signal
-/// that the cross-chain QoS average can't see. Surfaced as needs-attention only —
-/// it's a fixable per-deployment issue, not an indexer-wide grade condemnation.
-async fn detect_deployment_laggards(pool: &PgPool) -> Result<usize> {
-    let rows = sqlx::query(
-        r#"WITH latest AS (
-               SELECT DISTINCT ON (indexer_address, deployment_id)
-                      indexer_address, deployment_id, lag_blocks, health
-               FROM status_sample
-               WHERE sampled_at > NOW() - INTERVAL '2 hours'
-                 AND deployment_id <> ''
-                 AND probe_error IS NULL
-                 AND lag_blocks IS NOT NULL
-                 AND (health IS NULL OR health <> 'failed')
-               ORDER BY indexer_address, deployment_id, sampled_at DESC
-           ),
-           baseline AS (
-               SELECT deployment_id, MIN(lag_blocks) AS floor_lag, COUNT(*) AS peers
-               FROM latest GROUP BY deployment_id
+/// Flag per-(indexer, deployment) problems from the oracle's allocation QoS:
+///   • serving-errors-deployment — low success rate with real volume (the
+///     "synced but 400ing on subgraph X" case the per-indexer average misses);
+///   • behind-deployment — lagging the freshest *serving* peer on the same
+///     deployment (allocation-scoped, so syncing-not-allocated indexers don't
+///     false-positive, and same-deployment = same-chain so blocks compare).
+/// Both are needs-attention items (fixable per-deployment issues), not grade hits.
+async fn detect_allocation_issues(pool: &PgPool) -> Result<usize> {
+    let mut n = 0usize;
+
+    // 1. Serving errors on a specific deployment.
+    let errs = sqlx::query(
+        r#"SELECT indexer_address, deployment_id, success_rate, query_count
+           FROM allocation_qos
+           WHERE query_count >= 100 AND success_rate < 0.5"#,
+    )
+    .fetch_all(pool)
+    .await?;
+    for row in &errs {
+        let sr: f64 = row.get("success_rate");
+        let qc: i64 = row.get("query_count");
+        let item = AttentionItem {
+            indexer_address: row.get("indexer_address"),
+            kind: "serving-errors-deployment".to_string(),
+            deployment_id: row.get("deployment_id"),
+            severity: Severity::Critical,
+            urgency: 95.0 + (1.0 - sr) * 5.0,
+            title: format!("Serving errors on a deployment ({:.0}% success over {} queries)", sr * 100.0, qc),
+            detail: serde_json::json!({ "success_rate": sr, "query_count": qc }),
+        };
+        upsert_attention(pool, &item).await?;
+        n += 1;
+    }
+
+    // 2. Behind the freshest serving peer on a deployment.
+    let lags = sqlx::query(
+        r#"WITH baseline AS (
+               SELECT deployment_id, MIN(blocks_behind) AS floor, COUNT(*) AS peers
+               FROM allocation_qos GROUP BY deployment_id
            )
-           SELECT l.indexer_address, l.deployment_id, l.lag_blocks, l.health,
-                  b.floor_lag, b.peers
-           FROM latest l
-           JOIN baseline b ON b.deployment_id = l.deployment_id
+           SELECT a.indexer_address, a.deployment_id, a.blocks_behind, b.floor, b.peers
+           FROM allocation_qos a
+           JOIN baseline b ON b.deployment_id = a.deployment_id
            WHERE b.peers >= 3
-             AND l.lag_blocks > b.floor_lag + $1
-             AND l.lag_blocks > $1"#,
+             AND a.blocks_behind > b.floor + $1
+             AND a.blocks_behind > $1"#,
     )
     .bind(PER_DEPLOYMENT_LAG_MARGIN)
     .fetch_all(pool)
     .await?;
-
-    let mut n = 0usize;
-    for row in &rows {
-        let lag: i64 = row.get("lag_blocks");
-        let floor: i64 = row.get("floor_lag");
+    for row in &lags {
+        let bb: f64 = row.get("blocks_behind");
+        let floor: f64 = row.get("floor");
         let peers: i64 = row.get("peers");
-        let health: Option<String> = row.get("health");
         let item = AttentionItem {
-            indexer_address: row.get::<String, _>("indexer_address").to_lowercase(),
+            indexer_address: row.get("indexer_address"),
             kind: "behind-deployment".to_string(),
             deployment_id: row.get("deployment_id"),
             severity: Severity::High,
-            urgency: 60.0 + ((lag as f64) / 100_000.0).min(40.0),
-            title: format!("Behind on a deployment (~{} blocks; freshest peer at {})", lag, floor),
-            detail: serde_json::json!({
-                "lag_blocks": lag,
-                "peer_floor_lag": floor,
-                "peers": peers,
-                "health": health,
-            }),
+            urgency: 60.0 + (bb / 100_000.0).min(35.0),
+            title: format!("Behind on a deployment (~{:.0} blocks; freshest serving peer at {:.0})", bb, floor),
+            detail: serde_json::json!({ "blocks_behind": bb, "peer_floor": floor, "peers": peers }),
         };
         upsert_attention(pool, &item).await?;
         n += 1;
