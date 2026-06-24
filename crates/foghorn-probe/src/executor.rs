@@ -74,10 +74,17 @@ pub struct RawObservation {
 /// the `graph-attestation` header (`responseCID`), and the indexer address
 /// is recovered from the EIP-712 signature in that header.
 pub async fn execute_gateway_probe(req: GatewayProbeRequest) -> RawObservation {
+    // An IPFS hash (Qm…) is a deployment; anything else is a GNS subgraph id.
+    let path = if req.subgraph_id.starts_with("Qm") {
+        "deployments/id"
+    } else {
+        "subgraphs/id"
+    };
     let url = format!(
-        "{}/{}/subgraphs/id/{}",
+        "{}/{}/{}/{}",
         req.gateway_url.trim_end_matches('/'),
         req.api_key,
+        path,
         req.subgraph_id,
     );
 

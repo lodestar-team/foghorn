@@ -19,8 +19,16 @@ pub async fn run_probe_scheduler(config: FoghornConfig, pool: PgPool) -> Result<
         "Probe scheduler starting"
     );
 
-    let test_sets = load_test_sets(&config.test_sets_dir)?;
-    info!(count = test_sets.len(), "Test sets loaded");
+    let mut test_sets = load_test_sets(&config.test_sets_dir)?;
+    info!(count = test_sets.len(), "Curated test sets loaded");
+
+    // Broaden correctness coverage: auto-discover the most-indexed deployments
+    // and generate block-pinned probe queries via schema introspection.
+    if config.auto_discover_limit > 0 {
+        let discovered = crate::autodiscover::discover_test_sets(&config, config.auto_discover_limit).await;
+        test_sets.extend(discovered);
+        info!(total = test_sets.len(), "Test sets after auto-discovery");
+    }
 
     if test_sets.is_empty() {
         warn!("No test sets found in '{}' — probe scheduler will idle", config.test_sets_dir);

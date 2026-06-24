@@ -141,6 +141,9 @@ pub struct FoghornConfig {
     pub test_sets_dir: String,
     pub opted_in_indexers: Vec<IndexerConfig>,
     pub cors_origins: Vec<String>,
+    /// Max deployments to auto-discover + probe for correctness (0 = disabled,
+    /// curated test-sets only). Broadens correctness coverage across the roster.
+    pub auto_discover_limit: usize,
     pub gateway: Option<GatewayConfig>,
     pub lodestar: Option<LodestarConfig>,
     pub scoring: ScoringConfig,
@@ -170,6 +173,7 @@ impl Default for FoghornConfig {
             test_sets_dir: "./test-sets".to_string(),
             opted_in_indexers: vec![],
             cors_origins: vec!["*".to_string()],
+            auto_discover_limit: 12,
             gateway: None,
             lodestar: None,
             scoring: ScoringConfig::default(),

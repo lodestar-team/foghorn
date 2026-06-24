@@ -4,6 +4,7 @@ use foghorn_core::{
 };
 use tracing::info;
 
+mod autodiscover;
 mod cluster;
 mod discovery;
 mod executor;
