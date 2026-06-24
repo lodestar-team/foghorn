@@ -41,14 +41,10 @@ pub struct ScoreInputs {
     pub reo_status: Option<String>,
     pub ens_name: Option<String>,
 
-    // ── Direct /status summary (aggregated per indexer over the last hour) ──
-    /// The status endpoint returned no successful sample — indexer unreachable.
-    pub status_endpoint_down: bool,
-    /// Worst chainhead lag among the indexer's non-failed deployments. A
-    /// deterministically-failed deployment (broken subgraph) is excluded — that
-    /// is the subgraph author's bug, identical across all indexers.
-    pub status_lag_blocks: Option<i64>,
-    pub status_deployment: Option<String>,
+    // NOTE: direct /status probing is collected (status_sample) but NOT used for
+    // verdicts — firewalled endpoints and cross-chain/syncing deployments make it
+    // an unreliable judge. Freshness/availability/no-data are driven by the
+    // QoS oracle (query-derived) and Foghorn's own probes instead.
 
     // ── Sybil ──
     pub sybil_cluster_id: Option<String>,
@@ -96,9 +92,6 @@ fn correctness_score(i: &ScoreInputs) -> Option<f64> {
 
 fn availability_score(i: &ScoreInputs) -> Option<f64> {
     let mut parts: Vec<f64> = Vec::new();
-    if i.status_endpoint_down {
-        parts.push(0.0);
-    }
     if i.total_observations > 0 {
         let err_rate = i.error_observations as f64 / i.total_observations as f64;
         parts.push(100.0 * (1.0 - clamp01(err_rate)));
@@ -120,23 +113,10 @@ fn lag_to_score(lag: f64, behind_blocks: i64) -> f64 {
 }
 
 fn freshness_score(i: &ScoreInputs, cfg: &ScoringConfig) -> Option<f64> {
-    // An unreachable status endpoint is disqualifying. A single deterministically-
-    // failed deployment is NOT — that is a broken subgraph, not a stale indexer.
-    if i.status_endpoint_down {
-        return Some(0.0);
-    }
-    let mut parts: Vec<f64> = Vec::new();
-    if let Some(lag) = i.status_lag_blocks {
-        parts.push(lag_to_score(lag.max(0) as f64, cfg.behind_lag_blocks));
-    }
-    if let Some(bb) = i.qos_blocks_behind {
-        parts.push(lag_to_score(bb.max(0.0), cfg.behind_lag_blocks));
-    }
-    if parts.is_empty() {
-        None
-    } else {
-        Some(parts.iter().sum::<f64>() / parts.len() as f64)
-    }
+    // Driven by the QoS oracle's measured blocks-behind (query-derived, reliable),
+    // not /status latestBlock (nonsensical for syncing / cross-chain deployments).
+    let bb = i.qos_blocks_behind?;
+    Some(lag_to_score(bb.max(0.0), cfg.behind_lag_blocks))
 }
 
 fn coverage_score(i: &ScoreInputs, cfg: &ScoringConfig) -> Option<f64> {
@@ -259,12 +239,17 @@ fn build_reasons(
             i.error_observations, i.total_observations
         ));
     }
-    if i.status_endpoint_down {
-        r.push("status endpoint unreachable".to_string());
-    } else if let Some(lag) = i.status_lag_blocks {
-        if lag > cfg.behind_lag_blocks {
-            r.push(format!("behind chainhead by {} blocks", lag));
+    if let Some(bb) = i.qos_blocks_behind {
+        if bb > cfg.behind_lag_blocks as f64 {
+            r.push(format!("behind chainhead (~{:.0} blocks, QoS)", bb));
         }
+    }
+    if qos_failing(i, cfg) {
+        r.push(format!(
+            "low QoS success rate {:.0}% over {} queries",
+            i.qos_success_rate.unwrap_or(0.0),
+            i.qos_query_count.unwrap_or(0)
+        ));
     }
     if let (Some(_cov), Some(n)) = (coverage, i.allocation_count) {
         if n < cfg.low_coverage_subgraphs {
@@ -316,16 +301,23 @@ fn is_serving_bad_data(i: &ScoreInputs, cfg: &ScoringConfig) -> bool {
     i.correctness_faults >= cfg.bad_data_min_faults && fault_rate(i) >= cfg.bad_data_min_rate
 }
 
+fn qos_failing(i: &ScoreInputs, cfg: &ScoringConfig) -> bool {
+    // A meaningfully-queried indexer whose served success rate is poor — the
+    // "400s" the network sees. Requires real volume to avoid flagging idle indexers.
+    matches!(
+        (i.qos_success_rate, i.qos_query_count),
+        (Some(sr), Some(q)) if q >= cfg.qos_min_queries && sr < (1.0 - cfg.no_data_min_error_rate) * 100.0
+    )
+}
+
 fn is_serving_no_data(i: &ScoreInputs, cfg: &ScoringConfig) -> bool {
-    // Endpoint unreachable, or Foghorn's own probes are erroring. Deterministic
-    // per-deployment subgraph faults are deliberately NOT counted here.
-    i.status_endpoint_down
+    // Genuinely failing served queries (QoS), or Foghorn's own probes erroring.
+    qos_failing(i, cfg)
         || (i.recent_observations >= 3 && recent_error_rate(i) >= cfg.no_data_min_error_rate)
 }
 
 fn is_behind(i: &ScoreInputs, cfg: &ScoringConfig) -> bool {
-    i.status_lag_blocks.map(|l| l > cfg.behind_lag_blocks).unwrap_or(false)
-        || i.qos_blocks_behind.map(|b| b > cfg.behind_lag_blocks as f64).unwrap_or(false)
+    i.qos_blocks_behind.map(|b| b > cfg.behind_lag_blocks as f64).unwrap_or(false)
 }
 
 fn is_leech(i: &ScoreInputs, cfg: &ScoringConfig) -> bool {
@@ -373,7 +365,8 @@ fn derive_verdicts(i: &ScoreInputs, cfg: &ScoringConfig, composite: f64) -> Vec<
             Severity::Critical,
             "Serving errors / no data".to_string(),
             json!({
-                "endpoint_down": i.status_endpoint_down,
+                "qos_success_rate": i.qos_success_rate,
+                "qos_query_count": i.qos_query_count,
                 "recent_error_rate": recent_error_rate(i),
                 "recent_observations": i.recent_observations,
             }),
@@ -385,7 +378,7 @@ fn derive_verdicts(i: &ScoreInputs, cfg: &ScoringConfig, composite: f64) -> Vec<
             "behind-chainhead",
             Severity::High,
             "Behind chainhead".to_string(),
-            json!({ "lag_blocks": i.status_lag_blocks, "qos_blocks_behind": i.qos_blocks_behind }),
+            json!({ "qos_blocks_behind": i.qos_blocks_behind }),
         ));
     }
 
@@ -440,23 +433,18 @@ fn derive_verdicts(i: &ScoreInputs, cfg: &ScoringConfig, composite: f64) -> Vec<
 
 fn derive_attention(i: &ScoreInputs, cfg: &ScoringConfig) -> Vec<AttentionItem> {
     let mut a = Vec::new();
-    let dep = i.status_deployment.clone().unwrap_or_default();
 
     if is_serving_no_data(i, cfg) {
-        let lag = i.status_lag_blocks.unwrap_or(0).max(0) as f64;
         a.push(AttentionItem {
             indexer_address: i.indexer_address.clone(),
             kind: "serving-no-data".to_string(),
-            deployment_id: dep.clone(),
+            deployment_id: String::new(),
             severity: Severity::Critical,
-            urgency: 100.0 + lag.min(1000.0) / 10.0,
-            title: if i.status_endpoint_down {
-                "Status endpoint unreachable".to_string()
-            } else {
-                "Serving errors / no data".to_string()
-            },
+            urgency: 100.0 + (100.0 - i.qos_success_rate.unwrap_or(100.0)).max(0.0),
+            title: "Serving errors / no data".to_string(),
             detail: json!({
-                "endpoint_down": i.status_endpoint_down,
+                "qos_success_rate": i.qos_success_rate,
+                "qos_query_count": i.qos_query_count,
                 "recent_errors": i.recent_errors,
                 "recent_observations": i.recent_observations,
             }),
@@ -467,7 +455,7 @@ fn derive_attention(i: &ScoreInputs, cfg: &ScoringConfig) -> Vec<AttentionItem> 
         a.push(AttentionItem {
             indexer_address: i.indexer_address.clone(),
             kind: "serving-bad-data".to_string(),
-            deployment_id: dep.clone(),
+            deployment_id: String::new(),
             severity: Severity::Critical,
             urgency: 90.0 + (i.correctness_faults.min(100) as f64),
             title: "Serving divergent (likely wrong) data".to_string(),
@@ -476,20 +464,15 @@ fn derive_attention(i: &ScoreInputs, cfg: &ScoringConfig) -> Vec<AttentionItem> 
     }
 
     if is_behind(i, cfg) {
-        let lag = i
-            .status_lag_blocks
-            .map(|l| l as f64)
-            .or(i.qos_blocks_behind)
-            .unwrap_or(0.0)
-            .max(0.0);
+        let lag = i.qos_blocks_behind.unwrap_or(0.0).max(0.0);
         a.push(AttentionItem {
             indexer_address: i.indexer_address.clone(),
             kind: "behind-chainhead".to_string(),
-            deployment_id: dep,
+            deployment_id: String::new(),
             severity: Severity::High,
             urgency: 50.0 + lag.min(1000.0) / 20.0,
-            title: format!("Behind chainhead by {:.0} blocks", lag),
-            detail: json!({ "lag_blocks": i.status_lag_blocks, "qos_blocks_behind": i.qos_blocks_behind }),
+            title: format!("Behind chainhead (~{:.0} blocks)", lag),
+            detail: json!({ "qos_blocks_behind": i.qos_blocks_behind }),
         });
     }
 
@@ -519,8 +502,6 @@ mod tests {
             qos_query_count: Some(50_000),
             reo_status: Some("eligible".to_string()),
             ens_name: Some("good.eth".to_string()),
-            status_lag_blocks: Some(2),
-            status_endpoint_down: false,
             ..Default::default()
         }
     }
@@ -546,23 +527,34 @@ mod tests {
     }
 
     #[test]
-    fn unreachable_endpoint_is_serving_no_data() {
+    fn low_qos_success_is_serving_no_data() {
         let mut i = healthy();
-        i.status_endpoint_down = true;
+        i.qos_success_rate = Some(20.0); // 80% of served queries error
+        i.qos_query_count = Some(5000); // with real volume
         let out = judge(&i, &cfg());
-        assert_eq!(out.score.freshness_score, Some(0.0));
         assert!(out.verdicts.iter().any(|v| v.kind == "serving-no-data"));
         assert!(out.attention.iter().any(|a| a.kind == "serving-no-data" && a.urgency >= 100.0));
     }
 
     #[test]
     fn deterministic_subgraph_fault_does_not_flag_indexer() {
-        // A healthy, reachable indexer with no Foghorn probe errors must NOT be
-        // flagged serving-no-data just because some deployment failed elsewhere.
-        let i = healthy(); // endpoint up, no recent errors
+        // A healthy indexer with good QoS and no Foghorn probe errors must NOT be
+        // flagged serving-no-data — a failed deployment elsewhere is a broken
+        // subgraph (identical across indexers), not this indexer's fault.
+        let i = healthy();
         let out = judge(&i, &cfg());
         assert!(!out.verdicts.iter().any(|v| v.kind == "serving-no-data"));
         assert!(out.attention.is_empty());
+    }
+
+    #[test]
+    fn low_volume_failures_do_not_flag() {
+        // Poor success rate but negligible volume → not flagged (idle, not broken).
+        let mut i = healthy();
+        i.qos_success_rate = Some(10.0);
+        i.qos_query_count = Some(20);
+        let out = judge(&i, &cfg());
+        assert!(!out.verdicts.iter().any(|v| v.kind == "serving-no-data"));
     }
 
     #[test]
@@ -588,7 +580,7 @@ mod tests {
     #[test]
     fn behind_chainhead_attention() {
         let mut i = healthy();
-        i.status_lag_blocks = Some(500);
+        i.qos_blocks_behind = Some(500.0);
         let out = judge(&i, &cfg());
         assert!(out.verdicts.iter().any(|v| v.kind == "behind-chainhead"));
         assert!(out.attention.iter().any(|a| a.kind == "behind-chainhead"));

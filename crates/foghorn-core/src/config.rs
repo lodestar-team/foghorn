@@ -72,6 +72,7 @@ pub struct ScoringConfig {
     pub bad_data_min_rate: f64,      // and min fault rate (0..1)
     pub no_data_min_error_rate: f64, // error/timeout rate (0..1) over recent probes => serving-no-data
     pub behind_lag_blocks: i64,      // chainhead lag (blocks) considered "behind"
+    pub qos_min_queries: i64,        // min QoS query volume before QoS-based verdicts apply
 }
 
 impl Default for ScoringConfig {
@@ -94,7 +95,10 @@ impl Default for ScoringConfig {
             bad_data_min_faults: 3,
             bad_data_min_rate: 0.10,
             no_data_min_error_rate: 0.50,
-            behind_lag_blocks: 50,
+            // QoS blocks-behind mixes chains; on fast chains (e.g. Arbitrum) tens of
+            // blocks is sub-minute / fresh. Set high enough to catch only genuinely-stuck.
+            behind_lag_blocks: 300,
+            qos_min_queries: 500,
         }
     }
 }

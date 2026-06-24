@@ -34,12 +34,6 @@ struct Profile {
     reo_status: Option<String>,
 }
 
-#[derive(Default, Clone)]
-struct StatusSummary {
-    endpoint_down: bool,
-    max_lag: Option<i64>,
-}
-
 pub async fn run_score_loop(cfg: ScoringConfig, pool: PgPool) {
     info!(windows = ?cfg.windows, interval = cfg.interval_secs, "Scoring loop starting");
     loop {
@@ -59,7 +53,6 @@ pub async fn run_score_once(cfg: &ScoringConfig, pool: &PgPool) -> Result<usize>
         HashMap::new()
     });
     let profiles = load_profiles(pool).await?;
-    let status = load_status(pool).await?;
     let recent = load_probe_agg(pool, "6 hours").await?;
 
     let mut windows = cfg.windows.clone();
@@ -78,7 +71,7 @@ pub async fn run_score_once(cfg: &ScoringConfig, pool: &PgPool) -> Result<usize>
         keys.extend(agg.keys());
 
         for addr in keys {
-            let inputs = assemble(addr, *window, &agg, &recent, &profiles, &status, &sybil_map);
+            let inputs = assemble(addr, *window, &agg, &recent, &profiles, &sybil_map);
             let outcome = judge(&inputs, cfg);
             upsert_score(pool, &outcome.score).await?;
             scored += 1;
@@ -114,13 +107,11 @@ fn assemble(
     agg: &HashMap<String, ProbeAgg>,
     recent: &HashMap<String, ProbeAgg>,
     profiles: &HashMap<String, Profile>,
-    status: &HashMap<String, StatusSummary>,
     sybil_map: &HashMap<String, (String, f64)>,
 ) -> ScoreInputs {
     let a = agg.get(addr).cloned().unwrap_or_default();
     let r = recent.get(addr).cloned().unwrap_or_default();
     let p = profiles.get(addr).cloned().unwrap_or_default();
-    let s = status.get(addr).cloned().unwrap_or_default();
     let (sybil_cluster_id, sybil_confidence) = match sybil_map.get(addr) {
         Some((id, conf)) => (Some(id.clone()), Some(*conf)),
         None => (None, None),
@@ -143,9 +134,6 @@ fn assemble(
         qos_query_count: p.qos_query_count,
         reo_status: p.reo_status,
         ens_name: p.ens_name,
-        status_endpoint_down: s.endpoint_down,
-        status_lag_blocks: s.max_lag,
-        status_deployment: None,
         sybil_cluster_id,
         sybil_confidence,
     }
@@ -215,39 +203,6 @@ async fn load_profiles(pool: &PgPool) -> Result<HashMap<String, Profile>> {
                 qos_blocks_behind: row.get("qos_blocks_behind"),
                 qos_query_count: row.get("qos_query_count"),
                 reo_status: row.get("reo_status"),
-            },
-        );
-    }
-    Ok(map)
-}
-
-async fn load_status(pool: &PgPool) -> Result<HashMap<String, StatusSummary>> {
-    // Aggregate per indexer over the last hour:
-    //   endpoint_down — every status call failed (no successful sample) → unreachable.
-    //   max_lag       — worst chainhead lag among NON-FAILED deployments. A
-    //                   deterministically-failed deployment (broken subgraph, identical
-    //                   across all indexers) is excluded so it can't condemn the indexer.
-    let rows = sqlx::query(
-        r#"SELECT indexer_address,
-                  (COUNT(*) FILTER (WHERE probe_error IS NULL) = 0) AS endpoint_down,
-                  MAX(lag_blocks) FILTER (
-                      WHERE probe_error IS NULL
-                        AND fatal_error IS NULL
-                        AND (health IS NULL OR health <> 'failed')
-                  ) AS max_lag
-           FROM status_sample
-           WHERE sampled_at > NOW() - INTERVAL '1 hour'
-           GROUP BY indexer_address"#,
-    )
-    .fetch_all(pool)
-    .await?;
-    let mut map = HashMap::new();
-    for row in rows {
-        map.insert(
-            row.get::<String, _>("indexer_address").to_lowercase(),
-            StatusSummary {
-                endpoint_down: row.get("endpoint_down"),
-                max_lag: row.get("max_lag"),
             },
         );
     }
