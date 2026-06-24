@@ -52,6 +52,12 @@ pub async fn run_score_once(cfg: &ScoringConfig, api_key: Option<&str>, pool: &P
         warn!(error = %e, "Sybil detection failed");
         HashMap::new()
     });
+    // Flag chronically non-deterministic deployments before scoring so they can
+    // be excluded from correctness faulting.
+    if let Err(e) = detect_nondeterministic(pool).await {
+        warn!(error = %e, "Non-deterministic deployment detection failed");
+    }
+
     let profiles = load_profiles(pool).await?;
     let recent = load_probe_agg(pool, "6 hours").await?;
 
@@ -164,6 +170,7 @@ async fn load_probe_agg(pool: &PgPool, interval: &str) -> Result<HashMap<String,
                         AND o.response_hash IS NOT NULL
                         AND o.response_hash <> d.largest_by_count_hash
                         AND d.largest_by_count_size * 2 > r.n
+                        AND p.deployment_id NOT IN (SELECT deployment_id FROM nondeterministic_deployment)
                   ) AS faults
            FROM observation o
            JOIN probe p ON p.id = o.probe_id
@@ -191,6 +198,81 @@ async fn load_probe_agg(pool: &PgPool, interval: &str) -> Result<HashMap<String,
         );
     }
     Ok(map)
+}
+
+/// Flag deployments that diverge persistently (every round, across blocks) as
+/// non-deterministic — the subgraph's mappings, not the indexers, are at fault.
+async fn detect_nondeterministic(pool: &PgPool) -> Result<()> {
+    let rows = sqlx::query(
+        r#"SELECT p.deployment_id,
+                  COUNT(DISTINCT p.id)::int AS total,
+                  COUNT(DISTINCT d.probe_id)::int AS divergent
+           FROM probe p
+           LEFT JOIN divergence d ON d.probe_id = p.id
+           WHERE p.dispatched_at > NOW() - INTERVAL '7 days'
+           GROUP BY p.deployment_id
+           HAVING COUNT(DISTINCT d.probe_id) >= 3
+              AND COUNT(DISTINCT d.probe_id)::float8 / NULLIF(COUNT(DISTINCT p.id), 0) >= 0.5"#,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let mut ids: Vec<String> = Vec::new();
+    for row in &rows {
+        let dep: String = row.get("deployment_id");
+        let total: i32 = row.get("total");
+        let divergent: i32 = row.get("divergent");
+        let rate = divergent as f64 / (total.max(1) as f64);
+        let sample = sample_divergent_fields(pool, &dep).await.unwrap_or_default();
+        sqlx::query(
+            r#"INSERT INTO nondeterministic_deployment
+                 (deployment_id, divergent_probes, total_probes, divergence_rate, sample_fields, last_seen)
+               VALUES ($1,$2,$3,$4,$5, NOW())
+               ON CONFLICT (deployment_id) DO UPDATE SET
+                 divergent_probes = EXCLUDED.divergent_probes,
+                 total_probes = EXCLUDED.total_probes,
+                 divergence_rate = EXCLUDED.divergence_rate,
+                 sample_fields = EXCLUDED.sample_fields,
+                 last_seen = NOW()"#,
+        )
+        .bind(&dep)
+        .bind(divergent)
+        .bind(total)
+        .bind(rate)
+        .bind(serde_json::to_value(&sample)?)
+        .execute(pool)
+        .await?;
+        ids.push(dep);
+    }
+
+    // Drop deployments that no longer qualify (divergence cleared up).
+    sqlx::query("DELETE FROM nondeterministic_deployment WHERE deployment_id <> ALL($1)")
+        .bind(&ids)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Distinct trailing field names from a deployment's recent divergence diffs
+/// (e.g. ".../totalVolumeUSD" → "totalVolumeUSD") — shows devs what's unstable.
+async fn sample_divergent_fields(pool: &PgPool, deployment_id: &str) -> Result<Vec<String>> {
+    let rows = sqlx::query(
+        r#"SELECT DISTINCT regexp_replace(elem->>'path', '^.*/', '') AS field
+           FROM divergence d
+           JOIN probe p ON p.id = d.probe_id
+           CROSS JOIN LATERAL jsonb_array_elements(d.diff_patches) elem
+           WHERE p.deployment_id = $1
+             AND p.dispatched_at > NOW() - INTERVAL '7 days'
+           LIMIT 12"#,
+    )
+    .bind(deployment_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .iter()
+        .filter_map(|r| r.get::<Option<String>, _>("field"))
+        .filter(|s| !s.is_empty())
+        .collect())
 }
 
 async fn load_profiles(pool: &PgPool) -> Result<HashMap<String, Profile>> {

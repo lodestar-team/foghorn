@@ -51,6 +51,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/needs-attention", get(routes::needs_attention))
         .route("/v1/verdicts", get(routes::verdicts))
         .route("/v1/sybil", get(routes::sybil_clusters))
+        .route("/v1/nondeterministic", get(routes::nondeterministic))
         .layer(cors)
         .with_state(state);
 

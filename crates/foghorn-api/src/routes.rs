@@ -812,6 +812,31 @@ pub async fn verdicts(
     Ok(Json(json!({ "verdicts": items, "count": items.len() })))
 }
 
+/// Deployments flagged as non-deterministic (diverge every round — subgraph's fault).
+pub async fn nondeterministic(State(state): State<AppState>) -> Result<Json<Value>, StatusCode> {
+    let rows = sqlx::query(
+        r#"SELECT deployment_id, divergent_probes, total_probes, divergence_rate,
+                  sample_fields, first_seen, last_seen
+           FROM nondeterministic_deployment
+           ORDER BY divergence_rate DESC, divergent_probes DESC"#,
+    )
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let items: Vec<Value> = rows.iter().map(|r| json!({
+        "deployment_id": r.get::<String, _>("deployment_id"),
+        "divergent_probes": r.get::<i32, _>("divergent_probes"),
+        "total_probes": r.get::<i32, _>("total_probes"),
+        "divergence_rate": r.get::<f64, _>("divergence_rate"),
+        "sample_fields": r.get::<Value, _>("sample_fields"),
+        "first_seen": r.get::<chrono::DateTime<chrono::Utc>, _>("first_seen"),
+        "last_seen": r.get::<chrono::DateTime<chrono::Utc>, _>("last_seen"),
+    })).collect();
+
+    Ok(Json(json!({ "deployments": items, "count": items.len() })))
+}
+
 /// Detected operator-swarm clusters.
 pub async fn sybil_clusters(State(state): State<AppState>) -> Result<Json<Value>, StatusCode> {
     let rows = sqlx::query(
