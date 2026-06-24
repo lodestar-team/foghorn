@@ -1,10 +1,30 @@
 # Foghorn
 
-Deterministic query-quality observation for [The Graph Protocol](https://thegraph.com). Sends
-block-pinned GraphQL probes, canonicalises responses with JCS (RFC 8785), hashes them with
-SHA-256, clusters by hash, and computes RFC 6902 JSON-Patch diffs when clusters diverge.
+A network-quality **judge** for [The Graph Protocol](https://thegraph.com). Foghorn grades
+indexers, names names, and surfaces the freeloaders.
 
-No scoring. No verdicts. Just neutral observations.
+It earns the right to judge with a signal nobody else has: **correctness**. The QoS oracle
+knows an indexer was *fast* and returned *200s* — it cannot tell you the indexer returned the
+*right data*. Foghorn sends block-pinned GraphQL probes, canonicalises responses with JCS
+(RFC 8785), hashes with SHA-256, and clusters by hash. An indexer that lands in the minority
+cluster served confident, well-formed **garbage** — and Foghorn catches it.
+
+That correctness signal is then fused with QoS / stake / REO data (from the
+[Lodestar](https://lodestar-dashboard.com) API) and direct, unauthenticated `/status` health
+probing into:
+
+- a **composite A–F network-quality grade** per indexer,
+- **actionable verdicts** — `serving-bad-data`, `serving-no-data`, `behind-chainhead`,
+  `low-coverage`, `leech`, `reo-ineligible-candidate`, `dispute-candidate`,
+  `sybil-swarm-member` — each with evidence,
+- a **"Needs Attention" triage surface** — indexers *definitely* serving bad or no data right
+  now, ranked by urgency, the "fix this today" list, and
+- **sybil-swarm detection** — anonymous identities, registered within days of each other, with
+  near-identical large self-stake, crowding the same subgraphs: one operator wearing many hats.
+
+> Foghorn used to be a neutral observer ("no scoring, no verdicts"). It now passes judgement.
+> Methodology and thresholds are documented below and fully configurable — when you name
+> names, you show your working.
 
 ---
 
@@ -22,18 +42,29 @@ No scoring. No verdicts. Just neutral observations.
 - **JCS normalisation + SHA-256** — volatile fields stripped, keys sorted, then hashed.
   This is what the cluster comparison runs on, not the raw response bytes.
 - **Cluster analysis** — observations grouped by JCS hash. `cluster_count > 1` = divergence.
+  An indexer in a minority cluster on a divergent probe is recorded as a **correctness fault**.
 - **RFC 6902 diff** — JSON-Patch diff between the two largest cluster representatives,
   stored with the divergence record.
-- **Postgres storage** — `probe`, `observation`, `divergence`, `freshness_sample` tables.
-  sqlx 0.8 with runtime queries (no compile-time macro magic, no `SQLX_OFFLINE` needed).
+- **Lodestar ingest** — roster, QoS (success rate / latency / blocks-behind / query count),
+  REO eligibility, stake and ENS names are pulled from the Lodestar API into `indexer_profile`.
+- **Direct `/status` probing** — Foghorn polls each indexer's unauthenticated status endpoint
+  (no TAP) for per-deployment sync state, chainhead lag, and fatal errors → `status_sample`.
+- **Scoring engine** — a pure, unit-tested core (`foghorn-core::score`) fuses correctness,
+  availability, freshness, coverage and value sub-scores into a composite 0–100 + A–F grade,
+  derives verdicts, and builds the needs-attention list. Weights/thresholds are config-driven.
+- **Sybil-swarm detection** — conservative union-find clustering over the roster (anonymity +
+  creation-time proximity + near-identical self-stake + ≥3 members), with confidence scoring.
+- **Postgres storage** — v1/v2 tables plus `indexer_profile`, `status_sample`, `indexer_score`,
+  `verdict`, `attention_item`, `sybil_cluster`. sqlx 0.8 runtime queries (no `SQLX_OFFLINE`).
 - **REST API** (axum 0.7):
-  - `GET /v1/health`
-  - `GET /v1/stats`
-  - `GET /v1/feed?limit=50&deployment_id=...`
-  - `GET /v1/probe/:uuid`
-  - `GET /v1/indexer/:address/quality?days=30`
-  - `GET /v1/indexer/:address/freshness`
-  - `GET /v1/deployment/:id/quality?days=7`
+  - `GET /v1/health` · `GET /v1/stats` · `GET /v1/feed` · `GET /v1/probe/:uuid`
+  - `GET /v1/indexer/:address/quality?days=30` · `GET /v1/indexer/:address/freshness`
+  - `GET /v1/deployments` · `GET /v1/deployment/:id/quality?days=7`
+  - `GET /v1/indexers?window=30&order=desc` — ranked leaderboard with grades + sub-scores
+  - `GET /v1/indexer/:address/scorecard` — full breakdown: scores, verdicts, attention, sybil
+  - `GET /v1/needs-attention?kind=...` — urgency-ranked triage list
+  - `GET /v1/verdicts?kind=...&severity=...` — actionable verdict feed
+  - `GET /v1/sybil` — detected operator-swarm clusters
 - **Docker multi-stage build** — single `Dockerfile` with separate `probe` and `api` targets;
   `docker-compose.yml` for deployment.
 - **Lodestar integration** — the companion dashboard
@@ -52,13 +83,12 @@ No scoring. No verdicts. Just neutral observations.
   indexer uses TAP (Timeline Aggregation Protocol) for payment and won't accept
   unauthenticated queries. Implementing a full TAP payer (GRT escrow setup, EIP-712
   receipt signing, on-chain approval transactions) is scoped for a future milestone.
-- **Human-readable indexer attribution** — because TAP is not implemented, queries go
-  through the gateway. The `indexer_address` stored is the ecrecover'd allocation-key
-  address. To map this to `graphops.eth` you would need a maintained operator-key → indexer
-  registry, which is not built.
-- **Freshness monitor** — the `freshness` crate is a stub. It polls `_meta` but deployment
-  enumeration from the network subgraph is not wired in.
 - **IPFS daily bundle pinning** — observations are stored in Postgres only.
+- **On-chain dispute submission** — Foghorn flags `dispute-candidate` indexers; filing the
+  actual POI dispute is left to a human.
+- **Per-deployment crowding in sybil scoring** — the detector uses roster metadata (anonymity,
+  creation time, stake). Behavioural fingerprinting (identical response hashes / latency across
+  probes) is a planned confidence booster, not yet wired in.
 - **Indexer auto-discovery** — there is no network-subgraph crawl to discover opted-in
   indexers automatically. For direct mode (if TAP were implemented), indexers would be
   listed in `config.toml`.
@@ -70,18 +100,39 @@ No scoring. No verdicts. Just neutral observations.
 ## Architecture
 
 ```
-┌─────────────────┐         ┌──────────────────────────┐
-│  foghorn-probe  │─────────▶  The Graph Gateway        │
-│  (scheduler)    │  8 req/  │  (routes to indexers)    │
-│                 │  round   │  graph-attestation header │
-└────────┬────────┘          └──────────────────────────┘
-         │ JCS hash + ecrecover
-         ▼
-    ┌─────────┐    ┌────────────────┐
-    │ Postgres │◀───│  foghorn-api   │──▶ Lodestar dashboard
-    └─────────┘    │  (axum REST)   │
-                   └────────────────┘
+ gateway probes (divergence) ──┐
+ direct /status probes ────────┤──▶ Postgres ──▶ scoring engine ──▶ grades + verdicts
+ Lodestar API (roster/QoS/REO) ┘                  (foghorn-core::score)   + attention + sybil
+                                                          │
+                                  foghorn-api (axum) ◀────┘
+                                  /v1/indexers · /scorecard · /needs-attention
+                                  /verdicts · /sybil          │
+                                                              ▼
+                                                   Lodestar dashboard UI
 ```
+
+The probe binary runs four loops: the divergence **scheduler** (the correctness source), the
+Lodestar **ingest** loop, the direct **status** loop, and the **scorer** that fuses it all.
+
+---
+
+## Judgement methodology
+
+Each indexer gets a composite 0–100 score per rolling window (default 7d & 30d), a weighted mean
+over whichever sub-scores have data (weights renormalise over what's present):
+
+| Sub-score | Source | Weight |
+|---|---|--:|
+| **Correctness** | Foghorn minority-divergence rate (native — the unique signal) | 0.35 |
+| **Availability** | probe error rate + Lodestar QoS success rate | 0.25 |
+| **Freshness** | `/status` chainhead lag, `synced`, fatal errors; QoS blocks-behind | 0.20 |
+| **Coverage** | breadth of subgraphs served | 0.10 |
+| **Value** | stake-to-query ratio (leech detection) | 0.10 |
+
+Grade boundaries (A ≥ 90, B ≥ 75, C ≥ 60, D ≥ 40, else F), all weights, and every verdict
+threshold live in `[scoring]` in `config.toml` — tighten the bar without recompiling. Verdicts
+and the needs-attention surface are derived from the same signals; see `score.rs` for the exact
+rules (and its unit tests for worked examples).
 
 ---
 

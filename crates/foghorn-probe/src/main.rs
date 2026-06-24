@@ -7,9 +7,13 @@ use tracing::info;
 mod cluster;
 mod discovery;
 mod executor;
-mod freshness;
+mod ingest;
+mod lodestar;
 mod resolver;
 mod scheduler;
+mod scorer;
+mod status;
+mod sybil;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -29,12 +33,27 @@ async fn main() -> anyhow::Result<()> {
 
     info!("Database connected and migrations applied");
 
-    // Spawn freshness monitor alongside the probe scheduler
-    let freshness_pool = pool.clone();
-    let freshness_config = config.clone();
-    tokio::spawn(async move {
-        freshness::run_freshness_monitor(freshness_config, freshness_pool).await;
-    });
+    // Lodestar ingest loop — roster / QoS / REO into indexer_profile.
+    if let Some(lodestar) = config.lodestar.clone() {
+        let pool = pool.clone();
+        tokio::spawn(async move { ingest::run_ingest_loop(lodestar, pool).await });
+    } else {
+        info!("No [lodestar] config — roster/QoS ingest disabled");
+    }
+
+    // Direct /status health probing (unauthenticated, no TAP).
+    {
+        let status_cfg = config.status_probe.clone();
+        let pool = pool.clone();
+        tokio::spawn(async move { status::run_status_loop(status_cfg, pool).await });
+    }
+
+    // Scoring loop — grades, verdicts, attention, sybil clusters.
+    {
+        let scoring = config.scoring.clone();
+        let pool = pool.clone();
+        tokio::spawn(async move { scorer::run_score_loop(scoring, pool).await });
+    }
 
     scheduler::run_probe_scheduler(config, pool).await?;
 

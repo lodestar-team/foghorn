@@ -45,6 +45,12 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/indexer/:address/freshness", get(routes::indexer_freshness))
         .route("/v1/deployments", get(routes::deployments))
         .route("/v1/deployment/:deployment_id/quality", get(routes::deployment_quality))
+        // ── Judgement layer ──
+        .route("/v1/indexers", get(routes::indexers))
+        .route("/v1/indexer/:address/scorecard", get(routes::indexer_scorecard))
+        .route("/v1/needs-attention", get(routes::needs_attention))
+        .route("/v1/verdicts", get(routes::verdicts))
+        .route("/v1/sybil", get(routes::sybil_clusters))
         .layer(cors)
         .with_state(state);
 

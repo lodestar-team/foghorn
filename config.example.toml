@@ -21,3 +21,42 @@ address    = "0xabc..."
 url        = "https://indexer-1.example.com"
 auth_token = "your-free-query-token"
 stake_grt  = "500000"
+
+# ── Judgement layer ───────────────────────────────────────────────────────────
+
+# Lodestar dashboard API — primary source for roster / QoS / REO / stake.
+# Omit this whole section to disable roster/QoS ingest (correctness probing still runs).
+[lodestar]
+base_url             = "https://www.lodestar-dashboard.com"
+# api_key            = "optional-bearer-token"
+ingest_interval_secs = 3600
+
+# Direct /status health probing (unauthenticated — no TAP needed).
+[status_probe]
+enabled       = true
+interval_secs = 600
+concurrency   = 8
+timeout_secs  = 10
+
+# Composite-grade weights + verdict thresholds. Tunable without a recompile so
+# the network-quality bar can be tightened over time. Weights are renormalised
+# over whichever sub-scores are present for a given indexer.
+[scoring]
+windows        = [7, 30]   # rolling windows (days) to score over
+interval_secs  = 900
+w_correctness  = 0.35      # Foghorn's unique signal: serving WRONG data
+w_availability = 0.25      # errors / 400s / QoS success rate
+w_freshness    = 0.20      # chainhead lag / unsynced / fatal errors
+w_coverage     = 0.10      # breadth of subgraphs served
+w_value        = 0.10      # stake-to-query ratio (leech detection)
+grade_a        = 90.0
+grade_b        = 75.0
+grade_c        = 60.0
+grade_d        = 40.0
+low_coverage_subgraphs = 20       # fewer than this => low-coverage verdict
+leech_min_stake_grt    = 1000000  # high stake ...
+leech_max_queries      = 100      # ... but <= this many queries => leech
+bad_data_min_faults    = 3        # min minority-divergence faults for serving-bad-data
+bad_data_min_rate      = 0.10     # and min fault rate
+no_data_min_error_rate = 0.50     # recent error rate => serving-no-data
+behind_lag_blocks      = 50       # chainhead lag considered "behind"

@@ -495,3 +495,339 @@ pub async fn deployment_quality(
         }).collect::<Vec<_>>(),
     })))
 }
+
+// ── Judgement layer ───────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct IndexersParams {
+    pub window: Option<i32>,
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
+    pub order: Option<String>, // "asc" | "desc" (default desc = best first)
+}
+
+/// Ranked leaderboard: composite grade + sub-scores + verdict/attention flags.
+pub async fn indexers(
+    State(state): State<AppState>,
+    Query(params): Query<IndexersParams>,
+) -> Result<Json<Value>, StatusCode> {
+    let window = params.window.unwrap_or(30);
+    let limit = params.limit.unwrap_or(100).min(500);
+    let offset = params.offset.unwrap_or(0);
+    let asc = params.order.as_deref() == Some("asc");
+
+    let sql = format!(
+        r#"SELECT s.indexer_address, s.composite, s.grade, s.correctness_score,
+                  s.availability_score, s.freshness_score, s.coverage_score, s.value_score,
+                  s.sybil_flag, s.sybil_cluster_id, s.probe_count, s.reasons,
+                  p.ens_name, p.self_stake_grt, p.allocation_count, p.reo_status, p.qos_query_count,
+                  (SELECT COUNT(*) FROM verdict v WHERE v.indexer_address = s.indexer_address)::int AS verdict_count,
+                  EXISTS(SELECT 1 FROM attention_item a WHERE a.indexer_address = s.indexer_address) AS needs_attention
+           FROM indexer_score s
+           LEFT JOIN indexer_profile p ON p.indexer_address = s.indexer_address
+           WHERE s.window_days = $1
+           ORDER BY s.composite {} NULLS LAST
+           LIMIT $2 OFFSET $3"#,
+        if asc { "ASC" } else { "DESC" }
+    );
+
+    let rows = sqlx::query(&sql)
+        .bind(window)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&state.pool)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "indexers query failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    let list: Vec<Value> = rows.iter().map(indexer_row_json).collect();
+    Ok(Json(json!({ "window_days": window, "indexers": list, "count": list.len() })))
+}
+
+fn indexer_row_json(r: &sqlx::postgres::PgRow) -> Value {
+    json!({
+        "indexer_address": r.get::<String, _>("indexer_address"),
+        "ens_name": r.get::<Option<String>, _>("ens_name"),
+        "composite": r.get::<f64, _>("composite"),
+        "grade": r.get::<String, _>("grade"),
+        "sub_scores": {
+            "correctness": r.get::<Option<f64>, _>("correctness_score"),
+            "availability": r.get::<Option<f64>, _>("availability_score"),
+            "freshness": r.get::<Option<f64>, _>("freshness_score"),
+            "coverage": r.get::<Option<f64>, _>("coverage_score"),
+            "value": r.get::<Option<f64>, _>("value_score"),
+        },
+        "self_stake_grt": r.get::<Option<f64>, _>("self_stake_grt"),
+        "allocation_count": r.get::<Option<i32>, _>("allocation_count"),
+        "reo_status": r.get::<Option<String>, _>("reo_status"),
+        "qos_query_count": r.get::<Option<i64>, _>("qos_query_count"),
+        "probe_count": r.get::<i32, _>("probe_count"),
+        "sybil_flag": r.get::<bool, _>("sybil_flag"),
+        "sybil_cluster_id": r.get::<Option<String>, _>("sybil_cluster_id"),
+        "verdict_count": r.get::<i32, _>("verdict_count"),
+        "needs_attention": r.get::<bool, _>("needs_attention"),
+        "reasons": r.get::<Value, _>("reasons"),
+    })
+}
+
+/// Full scorecard for one indexer: all windows, verdicts, attention, sybil, profile.
+pub async fn indexer_scorecard(
+    State(state): State<AppState>,
+    Path(address): Path<String>,
+) -> Result<Json<Value>, StatusCode> {
+    let address = address.to_lowercase();
+
+    let scores = sqlx::query(
+        r#"SELECT window_days, composite, grade, correctness_score, availability_score,
+                  freshness_score, coverage_score, value_score, sybil_flag, sybil_cluster_id,
+                  probe_count, reasons, sub_scores, computed_at
+           FROM indexer_score WHERE indexer_address = $1 ORDER BY window_days"#,
+    )
+    .bind(&address)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    if scores.is_empty() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    let profile = sqlx::query(
+        r#"SELECT ens_name, url, created_at, self_stake_grt, delegated_grt, allocation_count,
+                  query_fees_collected_grt, reo_status, reo_source, lodestar_score, lodestar_grade,
+                  qos_query_count, qos_success_rate, qos_latency_ms, qos_blocks_behind
+           FROM indexer_profile WHERE indexer_address = $1"#,
+    )
+    .bind(&address)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let verdicts = sqlx::query(
+        "SELECT kind, severity, title, evidence, window_days, first_seen, last_seen
+         FROM verdict WHERE indexer_address = $1 ORDER BY last_seen DESC",
+    )
+    .bind(&address)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let attention = sqlx::query(
+        "SELECT kind, deployment_id, severity, urgency, title, detail, first_seen, last_seen
+         FROM attention_item WHERE indexer_address = $1 ORDER BY urgency DESC",
+    )
+    .bind(&address)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let sybil = sqlx::query(
+        r#"SELECT c.cluster_id, c.confidence, c.member_count, c.members, c.signals
+           FROM sybil_cluster c
+           WHERE c.members @> to_jsonb($1::text)"#,
+    )
+    .bind(&address)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(json!({
+        "indexer_address": address,
+        "profile": profile.as_ref().map(|p| json!({
+            "ens_name": p.get::<Option<String>, _>("ens_name"),
+            "url": p.get::<Option<String>, _>("url"),
+            "created_at": p.get::<Option<i64>, _>("created_at"),
+            "self_stake_grt": p.get::<Option<f64>, _>("self_stake_grt"),
+            "delegated_grt": p.get::<Option<f64>, _>("delegated_grt"),
+            "allocation_count": p.get::<Option<i32>, _>("allocation_count"),
+            "query_fees_collected_grt": p.get::<Option<f64>, _>("query_fees_collected_grt"),
+            "reo_status": p.get::<Option<String>, _>("reo_status"),
+            "reo_source": p.get::<Option<String>, _>("reo_source"),
+            "lodestar_score": p.get::<Option<f64>, _>("lodestar_score"),
+            "lodestar_grade": p.get::<Option<String>, _>("lodestar_grade"),
+            "qos": {
+                "query_count": p.get::<Option<i64>, _>("qos_query_count"),
+                "success_rate": p.get::<Option<f64>, _>("qos_success_rate"),
+                "latency_ms": p.get::<Option<f64>, _>("qos_latency_ms"),
+                "blocks_behind": p.get::<Option<f64>, _>("qos_blocks_behind"),
+            },
+        })),
+        "scores": scores.iter().map(|s| json!({
+            "window_days": s.get::<i32, _>("window_days"),
+            "composite": s.get::<f64, _>("composite"),
+            "grade": s.get::<String, _>("grade"),
+            "sub_scores": s.get::<Value, _>("sub_scores"),
+            "probe_count": s.get::<i32, _>("probe_count"),
+            "sybil_flag": s.get::<bool, _>("sybil_flag"),
+            "reasons": s.get::<Value, _>("reasons"),
+            "computed_at": s.get::<chrono::DateTime<chrono::Utc>, _>("computed_at"),
+        })).collect::<Vec<_>>(),
+        "verdicts": verdicts.iter().map(|v| json!({
+            "kind": v.get::<String, _>("kind"),
+            "severity": v.get::<String, _>("severity"),
+            "title": v.get::<String, _>("title"),
+            "evidence": v.get::<Value, _>("evidence"),
+            "window_days": v.get::<Option<i32>, _>("window_days"),
+            "first_seen": v.get::<chrono::DateTime<chrono::Utc>, _>("first_seen"),
+            "last_seen": v.get::<chrono::DateTime<chrono::Utc>, _>("last_seen"),
+        })).collect::<Vec<_>>(),
+        "needs_attention": attention.iter().map(|a| json!({
+            "kind": a.get::<String, _>("kind"),
+            "deployment_id": a.get::<String, _>("deployment_id"),
+            "severity": a.get::<String, _>("severity"),
+            "urgency": a.get::<f64, _>("urgency"),
+            "title": a.get::<String, _>("title"),
+            "detail": a.get::<Value, _>("detail"),
+            "first_seen": a.get::<chrono::DateTime<chrono::Utc>, _>("first_seen"),
+            "last_seen": a.get::<chrono::DateTime<chrono::Utc>, _>("last_seen"),
+        })).collect::<Vec<_>>(),
+        "sybil_cluster": sybil.as_ref().map(|c| json!({
+            "cluster_id": c.get::<String, _>("cluster_id"),
+            "confidence": c.get::<f64, _>("confidence"),
+            "member_count": c.get::<i32, _>("member_count"),
+            "members": c.get::<Value, _>("members"),
+            "signals": c.get::<Value, _>("signals"),
+        })),
+    })))
+}
+
+#[derive(Deserialize)]
+pub struct AttentionParams {
+    pub limit: Option<i64>,
+    pub kind: Option<String>,
+}
+
+/// The "needs attention" triage surface — indexers serving bad/no data right now.
+pub async fn needs_attention(
+    State(state): State<AppState>,
+    Query(params): Query<AttentionParams>,
+) -> Result<Json<Value>, StatusCode> {
+    let limit = params.limit.unwrap_or(100).min(500);
+
+    let rows = if let Some(ref kind) = params.kind {
+        sqlx::query(
+            r#"SELECT a.indexer_address, a.kind, a.deployment_id, a.severity, a.urgency,
+                      a.title, a.detail, a.first_seen, a.last_seen,
+                      p.ens_name, p.self_stake_grt, p.reo_status
+               FROM attention_item a
+               LEFT JOIN indexer_profile p ON p.indexer_address = a.indexer_address
+               WHERE a.kind = $1
+               ORDER BY a.urgency DESC, a.last_seen DESC
+               LIMIT $2"#,
+        )
+        .bind(kind)
+        .bind(limit)
+        .fetch_all(&state.pool)
+        .await
+    } else {
+        sqlx::query(
+            r#"SELECT a.indexer_address, a.kind, a.deployment_id, a.severity, a.urgency,
+                      a.title, a.detail, a.first_seen, a.last_seen,
+                      p.ens_name, p.self_stake_grt, p.reo_status
+               FROM attention_item a
+               LEFT JOIN indexer_profile p ON p.indexer_address = a.indexer_address
+               ORDER BY a.urgency DESC, a.last_seen DESC
+               LIMIT $1"#,
+        )
+        .bind(limit)
+        .fetch_all(&state.pool)
+        .await
+    }
+    .map_err(|e| {
+        tracing::error!(error = %e, "needs_attention query failed");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let items: Vec<Value> = rows.iter().map(|a| json!({
+        "indexer_address": a.get::<String, _>("indexer_address"),
+        "ens_name": a.get::<Option<String>, _>("ens_name"),
+        "self_stake_grt": a.get::<Option<f64>, _>("self_stake_grt"),
+        "reo_status": a.get::<Option<String>, _>("reo_status"),
+        "kind": a.get::<String, _>("kind"),
+        "deployment_id": a.get::<String, _>("deployment_id"),
+        "severity": a.get::<String, _>("severity"),
+        "urgency": a.get::<f64, _>("urgency"),
+        "title": a.get::<String, _>("title"),
+        "detail": a.get::<Value, _>("detail"),
+        "first_seen": a.get::<chrono::DateTime<chrono::Utc>, _>("first_seen"),
+        "last_seen": a.get::<chrono::DateTime<chrono::Utc>, _>("last_seen"),
+    })).collect();
+
+    Ok(Json(json!({ "items": items, "count": items.len() })))
+}
+
+#[derive(Deserialize)]
+pub struct VerdictsParams {
+    pub limit: Option<i64>,
+    pub kind: Option<String>,
+    pub severity: Option<String>,
+}
+
+/// Feed of actionable verdicts across all indexers.
+pub async fn verdicts(
+    State(state): State<AppState>,
+    Query(params): Query<VerdictsParams>,
+) -> Result<Json<Value>, StatusCode> {
+    let limit = params.limit.unwrap_or(100).min(500);
+
+    // Optional kind/severity filters via COALESCE-style match (NULL = no filter).
+    let rows = sqlx::query(
+        r#"SELECT v.indexer_address, v.kind, v.severity, v.title, v.evidence,
+                  v.window_days, v.first_seen, v.last_seen, p.ens_name
+           FROM verdict v
+           LEFT JOIN indexer_profile p ON p.indexer_address = v.indexer_address
+           WHERE ($1::text IS NULL OR v.kind = $1)
+             AND ($2::text IS NULL OR v.severity = $2)
+           ORDER BY
+             CASE v.severity WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END,
+             v.last_seen DESC
+           LIMIT $3"#,
+    )
+    .bind(&params.kind)
+    .bind(&params.severity)
+    .bind(limit)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|e| {
+        tracing::error!(error = %e, "verdicts query failed");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let items: Vec<Value> = rows.iter().map(|v| json!({
+        "indexer_address": v.get::<String, _>("indexer_address"),
+        "ens_name": v.get::<Option<String>, _>("ens_name"),
+        "kind": v.get::<String, _>("kind"),
+        "severity": v.get::<String, _>("severity"),
+        "title": v.get::<String, _>("title"),
+        "evidence": v.get::<Value, _>("evidence"),
+        "window_days": v.get::<Option<i32>, _>("window_days"),
+        "first_seen": v.get::<chrono::DateTime<chrono::Utc>, _>("first_seen"),
+        "last_seen": v.get::<chrono::DateTime<chrono::Utc>, _>("last_seen"),
+    })).collect();
+
+    Ok(Json(json!({ "verdicts": items, "count": items.len() })))
+}
+
+/// Detected operator-swarm clusters.
+pub async fn sybil_clusters(State(state): State<AppState>) -> Result<Json<Value>, StatusCode> {
+    let rows = sqlx::query(
+        r#"SELECT cluster_id, confidence, member_count, members, signals, detected_at
+           FROM sybil_cluster ORDER BY confidence DESC, member_count DESC"#,
+    )
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let clusters: Vec<Value> = rows.iter().map(|c| json!({
+        "cluster_id": c.get::<String, _>("cluster_id"),
+        "confidence": c.get::<f64, _>("confidence"),
+        "member_count": c.get::<i32, _>("member_count"),
+        "members": c.get::<Value, _>("members"),
+        "signals": c.get::<Value, _>("signals"),
+        "detected_at": c.get::<chrono::DateTime<chrono::Utc>, _>("detected_at"),
+    })).collect();
+
+    Ok(Json(json!({ "clusters": clusters, "count": clusters.len() })))
+}
