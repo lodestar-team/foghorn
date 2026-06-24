@@ -78,13 +78,13 @@ pub async fn run_ingest_once(client: &LodestarClient, pool: &PgPool) -> Result<(
         .await?;
     }
 
-    // 2. QoS — only for indexers Foghorn has observed (resolved real addresses).
-    let observed: Vec<String> = sqlx::query_scalar(
-        "SELECT DISTINCT indexer_address FROM allocation_map WHERE indexer_address IS NOT NULL",
-    )
-    .fetch_all(pool)
-    .await
-    .unwrap_or_default();
+    // 2. QoS — for the full roster, so every indexer's availability/value/freshness
+    //    sub-scores populate immediately rather than waiting on Foghorn probe coverage.
+    let observed: Vec<String> = roster
+        .iter()
+        .map(|ix| ix.id.to_lowercase())
+        .filter(|a| !a.is_empty())
+        .collect();
 
     // Bounded-concurrency QoS fetch + update.
     let mut qos_count = 0usize;
