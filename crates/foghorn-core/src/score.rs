@@ -41,11 +41,13 @@ pub struct ScoreInputs {
     pub reo_status: Option<String>,
     pub ens_name: Option<String>,
 
-    // ── Direct /status summary (most-recent sample, worst deployment) ──
+    // ── Direct /status summary (aggregated per indexer over the last hour) ──
+    /// The status endpoint returned no successful sample — indexer unreachable.
+    pub status_endpoint_down: bool,
+    /// Worst chainhead lag among the indexer's non-failed deployments. A
+    /// deterministically-failed deployment (broken subgraph) is excluded — that
+    /// is the subgraph author's bug, identical across all indexers.
     pub status_lag_blocks: Option<i64>,
-    pub status_synced: Option<bool>,
-    pub status_fatal_error: Option<String>,
-    pub status_probe_error: Option<String>,
     pub status_deployment: Option<String>,
 
     // ── Sybil ──
@@ -94,6 +96,9 @@ fn correctness_score(i: &ScoreInputs) -> Option<f64> {
 
 fn availability_score(i: &ScoreInputs) -> Option<f64> {
     let mut parts: Vec<f64> = Vec::new();
+    if i.status_endpoint_down {
+        parts.push(0.0);
+    }
     if i.total_observations > 0 {
         let err_rate = i.error_observations as f64 / i.total_observations as f64;
         parts.push(100.0 * (1.0 - clamp01(err_rate)));
@@ -115,8 +120,9 @@ fn lag_to_score(lag: f64, behind_blocks: i64) -> f64 {
 }
 
 fn freshness_score(i: &ScoreInputs, cfg: &ScoringConfig) -> Option<f64> {
-    // A reported fatal error or an unsynced deployment is disqualifying.
-    if i.status_fatal_error.is_some() || i.status_synced == Some(false) {
+    // An unreachable status endpoint is disqualifying. A single deterministically-
+    // failed deployment is NOT — that is a broken subgraph, not a stale indexer.
+    if i.status_endpoint_down {
         return Some(0.0);
     }
     let mut parts: Vec<f64> = Vec::new();
@@ -227,7 +233,7 @@ fn build_reasons(
     cfg: &ScoringConfig,
     correctness: Option<f64>,
     availability: Option<f64>,
-    freshness: Option<f64>,
+    _freshness: Option<f64>,
     coverage: Option<f64>,
     value: Option<f64>,
 ) -> Vec<String> {
@@ -253,12 +259,8 @@ fn build_reasons(
             i.error_observations, i.total_observations
         ));
     }
-    if freshness == Some(0.0) {
-        if i.status_fatal_error.is_some() {
-            r.push("deployment reporting a fatal error".to_string());
-        } else if i.status_synced == Some(false) {
-            r.push("deployment not synced".to_string());
-        }
+    if i.status_endpoint_down {
+        r.push("status endpoint unreachable".to_string());
     } else if let Some(lag) = i.status_lag_blocks {
         if lag > cfg.behind_lag_blocks {
             r.push(format!("behind chainhead by {} blocks", lag));
@@ -315,10 +317,10 @@ fn is_serving_bad_data(i: &ScoreInputs, cfg: &ScoringConfig) -> bool {
 }
 
 fn is_serving_no_data(i: &ScoreInputs, cfg: &ScoringConfig) -> bool {
-    i.status_synced == Some(false)
-        || i.status_fatal_error.is_some()
-        || i.status_probe_error.is_some()
-        || (i.recent_observations >= 2 && recent_error_rate(i) >= cfg.no_data_min_error_rate)
+    // Endpoint unreachable, or Foghorn's own probes are erroring. Deterministic
+    // per-deployment subgraph faults are deliberately NOT counted here.
+    i.status_endpoint_down
+        || (i.recent_observations >= 3 && recent_error_rate(i) >= cfg.no_data_min_error_rate)
 }
 
 fn is_behind(i: &ScoreInputs, cfg: &ScoringConfig) -> bool {
@@ -371,10 +373,9 @@ fn derive_verdicts(i: &ScoreInputs, cfg: &ScoringConfig, composite: f64) -> Vec<
             Severity::Critical,
             "Serving errors / no data".to_string(),
             json!({
-                "synced": i.status_synced,
-                "fatal_error": i.status_fatal_error,
-                "probe_error": i.status_probe_error,
+                "endpoint_down": i.status_endpoint_down,
                 "recent_error_rate": recent_error_rate(i),
+                "recent_observations": i.recent_observations,
             }),
         ));
     }
@@ -449,11 +450,13 @@ fn derive_attention(i: &ScoreInputs, cfg: &ScoringConfig) -> Vec<AttentionItem> 
             deployment_id: dep.clone(),
             severity: Severity::Critical,
             urgency: 100.0 + lag.min(1000.0) / 10.0,
-            title: "Serving errors / no data".to_string(),
+            title: if i.status_endpoint_down {
+                "Status endpoint unreachable".to_string()
+            } else {
+                "Serving errors / no data".to_string()
+            },
             detail: json!({
-                "synced": i.status_synced,
-                "fatal_error": i.status_fatal_error,
-                "probe_error": i.status_probe_error,
+                "endpoint_down": i.status_endpoint_down,
                 "recent_errors": i.recent_errors,
                 "recent_observations": i.recent_observations,
             }),
@@ -517,7 +520,7 @@ mod tests {
             reo_status: Some("eligible".to_string()),
             ens_name: Some("good.eth".to_string()),
             status_lag_blocks: Some(2),
-            status_synced: Some(true),
+            status_endpoint_down: false,
             ..Default::default()
         }
     }
@@ -543,14 +546,23 @@ mod tests {
     }
 
     #[test]
-    fn unsynced_deployment_is_serving_no_data() {
+    fn unreachable_endpoint_is_serving_no_data() {
         let mut i = healthy();
-        i.status_synced = Some(false);
-        i.status_fatal_error = Some("handler panic".to_string());
+        i.status_endpoint_down = true;
         let out = judge(&i, &cfg());
         assert_eq!(out.score.freshness_score, Some(0.0));
         assert!(out.verdicts.iter().any(|v| v.kind == "serving-no-data"));
         assert!(out.attention.iter().any(|a| a.kind == "serving-no-data" && a.urgency >= 100.0));
+    }
+
+    #[test]
+    fn deterministic_subgraph_fault_does_not_flag_indexer() {
+        // A healthy, reachable indexer with no Foghorn probe errors must NOT be
+        // flagged serving-no-data just because some deployment failed elsewhere.
+        let i = healthy(); // endpoint up, no recent errors
+        let out = judge(&i, &cfg());
+        assert!(!out.verdicts.iter().any(|v| v.kind == "serving-no-data"));
+        assert!(out.attention.is_empty());
     }
 
     #[test]

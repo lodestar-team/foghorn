@@ -36,11 +36,8 @@ struct Profile {
 
 #[derive(Default, Clone)]
 struct StatusSummary {
-    deployment_id: Option<String>,
-    synced: Option<bool>,
-    lag_blocks: Option<i64>,
-    fatal_error: Option<String>,
-    probe_error: Option<String>,
+    endpoint_down: bool,
+    max_lag: Option<i64>,
 }
 
 pub async fn run_score_loop(cfg: ScoringConfig, pool: PgPool) {
@@ -146,11 +143,9 @@ fn assemble(
         qos_query_count: p.qos_query_count,
         reo_status: p.reo_status,
         ens_name: p.ens_name,
-        status_lag_blocks: s.lag_blocks,
-        status_synced: s.synced,
-        status_fatal_error: s.fatal_error,
-        status_probe_error: s.probe_error,
-        status_deployment: s.deployment_id,
+        status_endpoint_down: s.endpoint_down,
+        status_lag_blocks: s.max_lag,
+        status_deployment: None,
         sybil_cluster_id,
         sybil_confidence,
     }
@@ -227,18 +222,22 @@ async fn load_profiles(pool: &PgPool) -> Result<HashMap<String, Profile>> {
 }
 
 async fn load_status(pool: &PgPool) -> Result<HashMap<String, StatusSummary>> {
-    // One row per indexer: the most *concerning* sample in the last hour.
+    // Aggregate per indexer over the last hour:
+    //   endpoint_down — every status call failed (no successful sample) → unreachable.
+    //   max_lag       — worst chainhead lag among NON-FAILED deployments. A
+    //                   deterministically-failed deployment (broken subgraph, identical
+    //                   across all indexers) is excluded so it can't condemn the indexer.
     let rows = sqlx::query(
-        r#"SELECT DISTINCT ON (indexer_address)
-                  indexer_address, deployment_id, synced, lag_blocks, fatal_error, probe_error
+        r#"SELECT indexer_address,
+                  (COUNT(*) FILTER (WHERE probe_error IS NULL) = 0) AS endpoint_down,
+                  MAX(lag_blocks) FILTER (
+                      WHERE probe_error IS NULL
+                        AND fatal_error IS NULL
+                        AND (health IS NULL OR health <> 'failed')
+                  ) AS max_lag
            FROM status_sample
            WHERE sampled_at > NOW() - INTERVAL '1 hour'
-           ORDER BY indexer_address,
-                    (fatal_error IS NOT NULL) DESC,
-                    (probe_error IS NOT NULL) DESC,
-                    (synced IS FALSE) DESC,
-                    lag_blocks DESC NULLS LAST,
-                    sampled_at DESC"#,
+           GROUP BY indexer_address"#,
     )
     .fetch_all(pool)
     .await?;
@@ -247,11 +246,8 @@ async fn load_status(pool: &PgPool) -> Result<HashMap<String, StatusSummary>> {
         map.insert(
             row.get::<String, _>("indexer_address").to_lowercase(),
             StatusSummary {
-                deployment_id: row.get("deployment_id"),
-                synced: row.get("synced"),
-                lag_blocks: row.get("lag_blocks"),
-                fatal_error: row.get("fatal_error"),
-                probe_error: row.get("probe_error"),
+                endpoint_down: row.get("endpoint_down"),
+                max_lag: row.get("max_lag"),
             },
         );
     }
