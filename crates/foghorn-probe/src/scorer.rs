@@ -303,9 +303,10 @@ async fn detect_allocation_issues(pool: &PgPool) -> Result<usize> {
     }
     for (indexer, deps) in by_indexer {
         if deps.len() >= ROLLUP_THRESHOLD {
-            // Indexer-wide outage → one item.
+            // Indexer-wide outage → one item. Store the FULL deployment list so the
+            // dashboard can expand it (not just 3 examples).
             let total_q: i64 = deps.iter().map(|(_, _, q)| q).sum();
-            let examples: Vec<&str> = deps.iter().take(3).map(|(d, _, _)| d.as_str()).collect();
+            let deployments: Vec<&str> = deps.iter().map(|(d, _, _)| d.as_str()).collect();
             let item = AttentionItem {
                 indexer_address: indexer,
                 kind: "serving-errors".to_string(),
@@ -316,7 +317,7 @@ async fn detect_allocation_issues(pool: &PgPool) -> Result<usize> {
                 detail: serde_json::json!({
                     "deployment_count": deps.len(),
                     "total_queries": total_q,
-                    "examples": examples,
+                    "deployments": deployments,
                 }),
             };
             upsert_attention(pool, &item).await?;
@@ -365,7 +366,7 @@ async fn detect_allocation_issues(pool: &PgPool) -> Result<usize> {
     for (indexer, deps) in lag_by_indexer {
         if deps.len() >= ROLLUP_THRESHOLD {
             let worst = deps.iter().map(|(_, b, _)| *b).fold(0.0_f64, f64::max);
-            let examples: Vec<&str> = deps.iter().take(3).map(|(d, _, _)| d.as_str()).collect();
+            let deployments: Vec<&str> = deps.iter().map(|(d, _, _)| d.as_str()).collect();
             let item = AttentionItem {
                 indexer_address: indexer,
                 kind: "behind-deployments".to_string(),
@@ -373,7 +374,7 @@ async fn detect_allocation_issues(pool: &PgPool) -> Result<usize> {
                 severity: Severity::High,
                 urgency: 65.0 + (deps.len() as f64).min(30.0),
                 title: format!("Behind on {} deployments (worst ~{:.0} blocks)", deps.len(), worst),
-                detail: serde_json::json!({ "deployment_count": deps.len(), "worst_blocks_behind": worst, "examples": examples }),
+                detail: serde_json::json!({ "deployment_count": deps.len(), "worst_blocks_behind": worst, "deployments": deployments }),
             };
             upsert_attention(pool, &item).await?;
             n += 1;
