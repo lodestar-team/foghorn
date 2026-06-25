@@ -59,6 +59,7 @@ pub async fn run_score_once(cfg: &ScoringConfig, api_key: Option<&str>, pool: &P
     }
 
     let profiles = load_profiles(pool).await?;
+    let alloc_health = load_alloc_health(pool).await?;
     let recent = load_probe_agg(pool, "6 hours").await?;
 
     let mut windows = cfg.windows.clone();
@@ -77,7 +78,7 @@ pub async fn run_score_once(cfg: &ScoringConfig, api_key: Option<&str>, pool: &P
         keys.extend(agg.keys());
 
         for addr in keys {
-            let inputs = assemble(addr, *window, &agg, &recent, &profiles, &sybil_map);
+            let inputs = assemble(addr, *window, &agg, &recent, &profiles, &alloc_health, &sybil_map);
             let outcome = judge(&inputs, cfg);
             upsert_score(pool, &outcome.score).await?;
             scored += 1;
@@ -121,11 +122,14 @@ fn assemble(
     agg: &HashMap<String, ProbeAgg>,
     recent: &HashMap<String, ProbeAgg>,
     profiles: &HashMap<String, Profile>,
+    alloc_health: &HashMap<String, (i64, i64)>,
     sybil_map: &HashMap<String, (String, f64)>,
 ) -> ScoreInputs {
     let a = agg.get(addr).cloned().unwrap_or_default();
     let r = recent.get(addr).cloned().unwrap_or_default();
     let p = profiles.get(addr).cloned().unwrap_or_default();
+    let (qos_deployments_measured, qos_deployments_erroring) =
+        alloc_health.get(addr).copied().unwrap_or((0, 0));
     let (sybil_cluster_id, sybil_confidence) = match sybil_map.get(addr) {
         Some((id, conf)) => (Some(id.clone()), Some(*conf)),
         None => (None, None),
@@ -148,6 +152,8 @@ fn assemble(
         qos_query_count: p.qos_query_count,
         reo_status: p.reo_status,
         ens_name: p.ens_name,
+        qos_deployments_measured,
+        qos_deployments_erroring,
         sybil_cluster_id,
         sybil_confidence,
     }
@@ -433,6 +439,30 @@ async fn load_profiles(pool: &PgPool) -> Result<HashMap<String, Profile>> {
                 qos_query_count: row.get("qos_query_count"),
                 reo_status: row.get("reo_status"),
             },
+        );
+    }
+    Ok(map)
+}
+
+/// Per-indexer deployment-serving health from the oracle's allocation QoS:
+/// (materially-queried deployments, erroring deployments). "Erroring" mirrors
+/// detect_allocation_issues (query_count >= 100 AND success_rate < 0.5), so the
+/// grade penalty and the needs-attention items agree on what "broken" means.
+async fn load_alloc_health(pool: &PgPool) -> Result<HashMap<String, (i64, i64)>> {
+    let rows = sqlx::query(
+        r#"SELECT LOWER(indexer_address) AS addr,
+                  COUNT(*) FILTER (WHERE query_count >= 100)::bigint AS measured,
+                  COUNT(*) FILTER (WHERE query_count >= 100 AND success_rate < 0.5)::bigint AS erroring
+           FROM allocation_qos
+           GROUP BY LOWER(indexer_address)"#,
+    )
+    .fetch_all(pool)
+    .await?;
+    let mut map = HashMap::new();
+    for row in rows {
+        map.insert(
+            row.get::<String, _>("addr"),
+            (row.get::<i64, _>("measured"), row.get::<i64, _>("erroring")),
         );
     }
     Ok(map)

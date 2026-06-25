@@ -74,6 +74,8 @@ pub struct ScoringConfig {
     pub behind_lag_blocks: i64,      // chainhead lag (blocks) considered "behind"
     pub qos_min_queries: i64,        // min QoS query volume before QoS-based verdicts apply
     pub sybil_grade_penalty: f64,    // composite multiplier removed at full sybil confidence (0..1)
+    pub serving_grade_penalty: f64,  // composite multiplier removed when ALL measured deployments error (0..1)
+    pub serving_min_deployments: i64, // min materially-queried deployments before the serving penalty applies
 }
 
 impl Default for ScoringConfig {
@@ -107,6 +109,13 @@ impl Default for ScoringConfig {
             qos_min_queries: 500,
             // A 90%-confidence swarm member loses ~54% of its composite (e.g. A97 → ~D).
             sybil_grade_penalty: 0.6,
+            // An indexer serving errors across most of the deployments it actually
+            // receives traffic on can't be an A: the penalty scales with the fraction
+            // of materially-queried deployments that are erroring (success < 50%).
+            // At ~half its deployments broken (e.g. ellipfra: 26/~50), composite drops
+            // ~35% — A99 → ~C. Gated by serving_min_deployments to ignore one-off noise.
+            serving_grade_penalty: 0.7,
+            serving_min_deployments: 3,
         }
     }
 }

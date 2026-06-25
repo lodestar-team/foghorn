@@ -41,6 +41,14 @@ pub struct ScoreInputs {
     pub reo_status: Option<String>,
     pub ens_name: Option<String>,
 
+    // ── Per-deployment serving health (oracle allocation QoS) ──
+    // The indexer-wide qos_success_rate is query-weighted, so a handful of dead
+    // deployments vanish under a healthy bulk. These count deployments the indexer
+    // actually receives material traffic on, and how many are erroring (success
+    // < 50%), so broad serving failure can bite the grade the query-weighted mean misses.
+    pub qos_deployments_measured: i64,
+    pub qos_deployments_erroring: i64,
+
     // NOTE: direct /status probing is collected (status_sample) but NOT used for
     // verdicts — firewalled endpoints and cross-chain/syncing deployments make it
     // an unreliable judge. Freshness/availability/no-data are driven by the
@@ -90,7 +98,18 @@ fn correctness_score(i: &ScoreInputs) -> Option<f64> {
     Some(100.0 * (1.0 - clamp01(fault_rate)))
 }
 
-fn availability_score(i: &ScoreInputs) -> Option<f64> {
+/// Fraction (0..1) of an indexer's materially-queried deployments that are
+/// serving errors. None when there isn't enough deployment coverage to judge.
+fn serving_broken_fraction(i: &ScoreInputs, cfg: &ScoringConfig) -> Option<f64> {
+    if i.qos_deployments_measured < cfg.serving_min_deployments {
+        return None;
+    }
+    Some(clamp01(
+        i.qos_deployments_erroring as f64 / i.qos_deployments_measured as f64,
+    ))
+}
+
+fn availability_score(i: &ScoreInputs, cfg: &ScoringConfig) -> Option<f64> {
     let mut parts: Vec<f64> = Vec::new();
     if i.total_observations > 0 {
         let err_rate = i.error_observations as f64 / i.total_observations as f64;
@@ -98,6 +117,11 @@ fn availability_score(i: &ScoreInputs) -> Option<f64> {
     }
     if let Some(q) = i.qos_success_rate {
         parts.push(q.max(0.0).min(100.0));
+    }
+    // Per-deployment serving health — surfaces broad failure the query-weighted
+    // mean hides (an indexer can be 99% by volume yet erroring on half its subgraphs).
+    if let Some(broken) = serving_broken_fraction(i, cfg) {
+        parts.push(100.0 * (1.0 - broken));
     }
     if parts.is_empty() {
         None
@@ -178,7 +202,7 @@ pub fn judge(i: &ScoreInputs, cfg: &ScoringConfig) -> ScoreOutcome {
     }
 
     let correctness = correctness_score(i);
-    let availability = availability_score(i);
+    let availability = availability_score(i, cfg);
     let freshness = freshness_score(i, cfg);
     let coverage = coverage_score(i, cfg);
     let value = value_score(i, cfg);
@@ -208,11 +232,17 @@ pub fn judge(i: &ScoreInputs, cfg: &ScoringConfig) -> ScoreOutcome {
     // Swarm membership bites the grade: a confirmed operator-swarm member is a
     // network-health problem regardless of how cleanly it serves data. The
     // penalty scales with detection confidence.
-    let composite = if sybil_flag {
+    let mut composite = if sybil_flag {
         raw_composite * (1.0 - i.sybil_confidence.unwrap_or(0.0) * cfg.sybil_grade_penalty)
     } else {
         raw_composite
     };
+    // Broad serving failure bites the grade too: an indexer erroring across most of
+    // the deployments it's actually queried on can't be an A, even if its
+    // query-weighted success rate looks fine. Scales with the broken fraction.
+    if let Some(broken) = serving_broken_fraction(i, cfg) {
+        composite *= 1.0 - broken * cfg.serving_grade_penalty;
+    }
     let grade = grade_for(composite, cfg).to_string();
 
     let reasons = build_reasons(i, cfg, correctness, availability, freshness, coverage, value);
@@ -295,6 +325,14 @@ fn build_reasons(
             i.qos_success_rate.unwrap_or(0.0),
             i.qos_query_count.unwrap_or(0)
         ));
+    }
+    if let Some(broken) = serving_broken_fraction(i, cfg) {
+        if broken > 0.0 {
+            r.push(format!(
+                "serving errors on {}/{} materially-queried deployments",
+                i.qos_deployments_erroring, i.qos_deployments_measured
+            ));
+        }
     }
     if let (Some(_cov), Some(n)) = (coverage, i.allocation_count) {
         if n < cfg.low_coverage_subgraphs {
@@ -687,6 +725,32 @@ mod tests {
         let out = judge(&i, &cfg());
         assert!(out.score.correctness_score.is_none());
         assert!(out.score.composite > 0.0);
+    }
+
+    #[test]
+    fn broad_serving_failure_bites_the_grade() {
+        // An indexer with a healthy query-weighted success rate but erroring across
+        // most of its materially-queried deployments must not stay an A.
+        let clean = judge(&healthy(), &cfg()).score.composite;
+        let mut i = healthy();
+        i.qos_deployments_measured = 50;
+        i.qos_deployments_erroring = 26; // ~half its deployments broken
+        let out = judge(&i, &cfg());
+        assert!(out.score.composite < clean - 20.0, "broad failure should drop composite: {} vs {}", out.score.composite, clean);
+        assert!(out.score.availability_score.unwrap() < 90.0, "availability should reflect it: {:?}", out.score.availability_score);
+        assert!(out.score.reasons.iter().any(|r| r.contains("materially-queried deployments")));
+    }
+
+    #[test]
+    fn one_off_deployment_error_does_not_bite() {
+        // A single erroring deployment below the min-deployments gate is noise, not
+        // a broadly-broken indexer — the grade should be unaffected.
+        let clean = judge(&healthy(), &cfg()).score.composite;
+        let mut i = healthy();
+        i.qos_deployments_measured = 2;
+        i.qos_deployments_erroring = 1;
+        let out = judge(&i, &cfg());
+        assert!((out.score.composite - clean).abs() < 0.01, "below gate should not change grade: {} vs {}", out.score.composite, clean);
     }
 
     #[test]
