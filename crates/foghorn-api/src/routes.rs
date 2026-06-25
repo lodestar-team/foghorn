@@ -839,6 +839,32 @@ pub async fn deployment_qos(
     Ok(Json(json!({ "deployment_id": deployment_id, "indexers": indexers })))
 }
 
+/// Per-deployment query success/lag for one INDEXER (all its allocations) —
+/// for the Active Allocations table on the indexer profile.
+pub async fn indexer_allocations_qos(
+    State(state): State<AppState>,
+    Path(address): Path<String>,
+) -> Result<Json<Value>, StatusCode> {
+    let rows = sqlx::query(
+        r#"SELECT deployment_id, success_rate, blocks_behind, query_count
+           FROM allocation_qos WHERE indexer_address = $1
+           ORDER BY query_count DESC"#,
+    )
+    .bind(address.to_lowercase())
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let deployments: Vec<Value> = rows.iter().map(|r| json!({
+        "deployment_id": r.get::<String, _>("deployment_id"),
+        "success_rate": r.get::<Option<f64>, _>("success_rate"),
+        "blocks_behind": r.get::<Option<f64>, _>("blocks_behind"),
+        "query_count": r.get::<Option<i64>, _>("query_count"),
+    })).collect();
+
+    Ok(Json(json!({ "indexer_address": address.to_lowercase(), "deployments": deployments })))
+}
+
 /// Deployments flagged as non-deterministic (diverge every round — subgraph's fault).
 pub async fn nondeterministic(State(state): State<AppState>) -> Result<Json<Value>, StatusCode> {
     let rows = sqlx::query(

@@ -53,6 +53,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/sybil", get(routes::sybil_clusters))
         .route("/v1/nondeterministic", get(routes::nondeterministic))
         .route("/v1/deployment/:deployment_id/qos", get(routes::deployment_qos))
+        .route("/v1/indexer/:address/allocations-qos", get(routes::indexer_allocations_qos))
         .layer(cors)
         .with_state(state);
 
