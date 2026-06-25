@@ -42,10 +42,9 @@ pub async fn run_alert_loop(webhook: String, pool: PgPool) {
 /// One poll cycle. Builds the full current failure roster, and posts it (in full)
 /// if it changed since the last post, or once a day as a liveness repost.
 async fn run_cycle(client: &reqwest::Client, webhook: &str, pool: &PgPool) -> Result<()> {
-    let lines = current_failure_lines(pool).await?;
-    let signature = lines.join("\n");
+    let roster = current_failure_roster(pool).await?;
 
-    // Read last-posted signature + whether 24h has elapsed (daily liveness repost).
+    // Read last-posted fingerprint + whether 24h has elapsed (daily liveness repost).
     let (last_fingerprint, due): (Option<String>, bool) = sqlx::query_as(
         "SELECT last_fingerprint, (last_post IS NULL OR last_post < NOW() - INTERVAL '24 hours') FROM alerter_state",
     )
@@ -53,10 +52,15 @@ async fn run_cycle(client: &reqwest::Client, webhook: &str, pool: &PgPool) -> Re
     .await
     .unwrap_or((None, true));
 
-    let changed = signature != last_fingerprint.unwrap_or_default();
+    // Change detection is on the roster + severity, NOT the exact counts — so an
+    // indexer drifting 26→27 deployments doesn't re-ping the channel; only a new
+    // failing indexer, a recovery, or a severity change does. The posted message
+    // still carries live counts, and the daily digest refreshes them regardless.
+    let changed = roster.fingerprint != last_fingerprint.unwrap_or_default();
     if !changed && !due {
-        return Ok(()); // nothing new and not yet time for the daily heartbeat
+        return Ok(()); // roster unchanged and not yet time for the daily digest
     }
+    let lines = roster.lines;
 
     let content = if lines.is_empty() {
         // No failures — an all-clear liveness note (only on change or the daily tick).
@@ -81,7 +85,7 @@ async fn run_cycle(client: &reqwest::Client, webhook: &str, pool: &PgPool) -> Re
     }
 
     sqlx::query("UPDATE alerter_state SET last_post = NOW(), last_fingerprint = $1")
-        .bind(&signature)
+        .bind(&roster.fingerprint)
         .execute(pool)
         .await?;
     info!(indexers = lines.len(), changed, "Posted failure roster to Discord");
@@ -102,9 +106,16 @@ struct IndexerAlert {
     behind_head: bool,
 }
 
-/// The full set of currently-failing indexers, one summary line each, sorted
-/// deterministically (so the signature is stable across cycles).
-async fn current_failure_lines(pool: &PgPool) -> Result<Vec<String>> {
+struct Roster {
+    /// One human-readable summary line per failing indexer (with live counts).
+    lines: Vec<String>,
+    /// Coarse change-detection signature: sorted `address:severity`, no counts.
+    fingerprint: String,
+}
+
+/// The full set of currently-failing indexers: display lines (with counts) plus a
+/// roster+severity fingerprint for change detection. Both deterministically ordered.
+async fn current_failure_roster(pool: &PgPool) -> Result<Roster> {
     let rows = sqlx::query(&format!(
         r#"SELECT a.indexer_address, a.kind, a.severity, a.detail,
                   COALESCE(p.ens_name, a.indexer_address) AS label
@@ -141,6 +152,15 @@ async fn current_failure_lines(pool: &PgPool) -> Result<Vec<String>> {
         }
     }
 
+    // Fingerprint = sorted address:severity, independent of counts and display
+    // order, so only roster/severity changes flip it (not a count drift or reorder).
+    let mut fp: Vec<String> = by
+        .iter()
+        .map(|(addr, a)| format!("{}:{}", addr, if a.critical { "C" } else { "H" }))
+        .collect();
+    fp.sort();
+    let fingerprint = fp.join(",");
+
     let mut alerts: Vec<IndexerAlert> = by.into_values().collect();
     // Critical first, then by serving-error breadth, then label — fully deterministic.
     alerts.sort_by(|a, b| {
@@ -150,7 +170,7 @@ async fn current_failure_lines(pool: &PgPool) -> Result<Vec<String>> {
             .then(a.label.cmp(&b.label))
     });
 
-    Ok(alerts
+    let lines: Vec<String> = alerts
         .iter()
         .map(|a| {
             let emoji = if a.critical { "🔴" } else { "🟠" };
@@ -169,7 +189,9 @@ async fn current_failure_lines(pool: &PgPool) -> Result<Vec<String>> {
             }
             format!("{emoji} **{}** — {}", a.label, parts.join("; "))
         })
-        .collect())
+        .collect();
+
+    Ok(Roster { lines, fingerprint })
 }
 
 /// Header + all lines + footer, joined (caller chunks it for Discord's limit).
