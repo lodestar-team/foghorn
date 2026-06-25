@@ -76,6 +76,7 @@ pub struct ScoringConfig {
     pub sybil_grade_penalty: f64,    // composite multiplier removed at full sybil confidence (0..1)
     pub serving_grade_penalty: f64,  // composite multiplier removed when ALL measured deployments error (0..1)
     pub serving_min_deployments: i64, // min materially-queried deployments before the serving penalty applies
+    pub serving_broken_count_ref: i64, // erroring-deployment count at which the absolute-count penalty saturates
 }
 
 impl Default for ScoringConfig {
@@ -116,6 +117,11 @@ impl Default for ScoringConfig {
             // ~35% — A99 → ~C. Gated by serving_min_deployments to ignore one-off noise.
             serving_grade_penalty: 0.7,
             serving_min_deployments: 3,
+            // Erroring on ~20 deployments saturates the absolute-count term, capping
+            // a big-but-mostly-healthy operator at ~C/D (e.g. ellipfra: 26 broken of
+            // ~600 → out of A). The broadly-dead (datanexus/pinax: ~all broken) still
+            // hit F via the fraction term.
+            serving_broken_count_ref: 20,
         }
     }
 }

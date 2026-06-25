@@ -100,6 +100,8 @@ fn correctness_score(i: &ScoreInputs) -> Option<f64> {
 
 /// Fraction (0..1) of an indexer's materially-queried deployments that are
 /// serving errors. None when there isn't enough deployment coverage to judge.
+/// This is the honest "what share of your served deployments work" measure that
+/// feeds the availability sub-score.
 fn serving_broken_fraction(i: &ScoreInputs, cfg: &ScoringConfig) -> Option<f64> {
     if i.qos_deployments_measured < cfg.serving_min_deployments {
         return None;
@@ -107,6 +109,19 @@ fn serving_broken_fraction(i: &ScoreInputs, cfg: &ScoringConfig) -> Option<f64> 
     Some(clamp01(
         i.qos_deployments_erroring as f64 / i.qos_deployments_measured as f64,
     ))
+}
+
+/// Severity (0..1) driving the composite grade penalty. The max of two signals:
+///   • fraction — a totally-broken indexer (errors on ~all deployments) → full hit,
+///   • absolute count — erroring on *many* deployments caps you out of A even when
+///     proportionally small (a big operator neglecting 26 subgraphs is still 26
+///     broken subgraphs). The count term is capped at half so a mostly-healthy
+///     giant lands at C/D, not F (which is reserved for the broadly-dead).
+fn serving_broken_severity(i: &ScoreInputs, cfg: &ScoringConfig) -> Option<f64> {
+    let frac = serving_broken_fraction(i, cfg)?;
+    let count_factor =
+        clamp01(i.qos_deployments_erroring as f64 / cfg.serving_broken_count_ref.max(1) as f64);
+    Some(frac.max(0.5 * count_factor))
 }
 
 fn availability_score(i: &ScoreInputs, cfg: &ScoringConfig) -> Option<f64> {
@@ -238,10 +253,10 @@ pub fn judge(i: &ScoreInputs, cfg: &ScoringConfig) -> ScoreOutcome {
         raw_composite
     };
     // Broad serving failure bites the grade too: an indexer erroring across most of
-    // the deployments it's actually queried on can't be an A, even if its
-    // query-weighted success rate looks fine. Scales with the broken fraction.
-    if let Some(broken) = serving_broken_fraction(i, cfg) {
-        composite *= 1.0 - broken * cfg.serving_grade_penalty;
+    // the deployments it's actually queried on — or across many in absolute terms —
+    // can't be an A, even if its query-weighted success rate looks fine.
+    if let Some(severity) = serving_broken_severity(i, cfg) {
+        composite *= 1.0 - severity * cfg.serving_grade_penalty;
     }
     let grade = grade_for(composite, cfg).to_string();
 
@@ -739,6 +754,17 @@ mod tests {
         assert!(out.score.composite < clean - 20.0, "broad failure should drop composite: {} vs {}", out.score.composite, clean);
         assert!(out.score.availability_score.unwrap() < 90.0, "availability should reflect it: {:?}", out.score.availability_score);
         assert!(out.score.reasons.iter().any(|r| r.contains("materially-queried deployments")));
+    }
+
+    #[test]
+    fn many_broken_deployments_caps_a_big_healthy_indexer() {
+        // The ellipfra case: 26 erroring of ~600 measured. Proportionally tiny, but
+        // 26 broken subgraphs must knock it out of A via the absolute-count floor.
+        let mut i = healthy();
+        i.qos_deployments_measured = 600;
+        i.qos_deployments_erroring = 26;
+        let out = judge(&i, &cfg());
+        assert_ne!(out.score.grade, "A", "26 broken deployments must not stay A: composite={}", out.score.composite);
     }
 
     #[test]
