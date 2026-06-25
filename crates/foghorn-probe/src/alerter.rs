@@ -9,7 +9,10 @@ use sqlx::{PgPool, Row};
 use std::time::Duration;
 use tracing::{info, warn};
 
-const POLL_SECS: u64 = 120;
+// Check hourly — matches the QoS-oracle ingest cadence (no new signal arrives
+// between ingests, so polling faster catches nothing sooner). An hour's worth of
+// new issues batches into a single message.
+const POLL_SECS: u64 = 3600;
 const MAX_LINES: usize = 12; // cap a single Discord message; summarise the rest
 const DASHBOARD: &str = "https://lodestar-dashboard.com";
 
