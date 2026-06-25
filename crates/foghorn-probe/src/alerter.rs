@@ -115,7 +115,7 @@ async fn alert_once(client: &reqwest::Client, webhook: &str, pool: &PgPool) -> R
 
     // Chunk into messages under Discord's limit — show ALL, never truncate.
     let header = format!("📯 **Foghorn — {} indexer{} need attention**", alerts.len(), plural(alerts.len() as i64));
-    let footer = format!("{}/foghorn", DASHBOARD);
+    let footer = format!("For more details — {}/foghorn", DASHBOARD);
     let mut messages: Vec<String> = Vec::new();
     let mut cur = String::new();
     for line in &lines {
