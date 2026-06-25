@@ -1,7 +1,8 @@
-//! Discord alerting. Pushes each new critical needs-attention item to a Discord
-//! webhook (#foghorn-alerts) exactly once, so serving failures / outages /
-//! genuine lag are caught the moment Foghorn detects them — no one has to be
-//! watching the dashboard. Disabled unless `alert_webhook` is configured.
+//! Discord alerting. Posts the FULL current failure roster to a Discord webhook
+//! (#foghorn-alerts) whenever it changes — an indexer appears, clears, or its
+//! failure summary shifts — so the channel always shows the complete picture, not
+//! a delta that would read as "everyone else recovered". Reposts once a day even
+//! when unchanged, as a liveness heartbeat. Disabled unless `alert_webhook` is set.
 
 use anyhow::Result;
 use serde_json::{json, Value};
@@ -11,13 +12,13 @@ use std::time::Duration;
 use tracing::{info, warn};
 
 // Check hourly — matches the QoS-oracle ingest cadence (no new signal arrives
-// between ingests, so polling faster catches nothing sooner). An hour's worth of
-// new issues batches into a single message.
+// between ingests, so polling faster catches nothing sooner). We post at most
+// once an hour, and only when the failure roster has actually changed.
 const POLL_SECS: u64 = 3600;
 const MSG_LIMIT: usize = 1800; // Discord hard-caps at 2000 chars; chunk under it
 const DASHBOARD: &str = "https://lodestar-dashboard.com";
 
-/// Kinds the alerter pushes (serving failures + genuine per-deployment lag).
+/// Kinds the alerter reports (serving failures + genuine per-deployment lag).
 const ALERT_FILTER: &str = "(severity = 'critical' OR kind IN \
     ('behind-deployment','behind-deployments','serving-errors-deployment','behind-chainhead'))";
 
@@ -38,67 +39,57 @@ pub async fn run_alert_loop(webhook: String, pool: PgPool) {
     }
 }
 
-/// One poll cycle: push new issues if any, otherwise a daily liveness heartbeat.
+/// One poll cycle. Builds the full current failure roster, and posts it (in full)
+/// if it changed since the last post, or once a day as a liveness repost.
 async fn run_cycle(client: &reqwest::Client, webhook: &str, pool: &PgPool) -> Result<()> {
-    let n = alert_once(client, webhook, pool).await?;
-    if n > 0 {
-        info!(alerted = n, "Pushed alerts to Discord");
-    } else {
-        maybe_heartbeat(client, webhook, pool).await?;
-    }
-    Ok(())
-}
+    let lines = current_failure_lines(pool).await?;
+    let signature = lines.join("\n");
 
-/// Post a "still on watch" heartbeat when there's nothing new AND it's been >24h
-/// since we last posted anything (alert or heartbeat). Proves the alerter is
-/// alive on quiet days without spamming on restarts or routine quiet cycles.
-async fn maybe_heartbeat(client: &reqwest::Client, webhook: &str, pool: &PgPool) -> Result<()> {
-    let due: bool = sqlx::query_scalar(
-        "SELECT last_post IS NULL OR last_post < NOW() - INTERVAL '24 hours' FROM alerter_state",
+    // Read last-posted signature + whether 24h has elapsed (daily liveness repost).
+    let (last_fingerprint, due): (Option<String>, bool) = sqlx::query_as(
+        "SELECT last_fingerprint, (last_post IS NULL OR last_post < NOW() - INTERVAL '24 hours') FROM alerter_state",
     )
     .fetch_one(pool)
     .await
-    .unwrap_or(true);
-    if !due {
-        return Ok(());
+    .unwrap_or((None, true));
+
+    let changed = signature != last_fingerprint.unwrap_or_default();
+    if !changed && !due {
+        return Ok(()); // nothing new and not yet time for the daily heartbeat
     }
 
-    let flagged: i64 = sqlx::query_scalar(&format!(
-        "SELECT COUNT(DISTINCT indexer_address) FROM attention_item WHERE {ALERT_FILTER}"
-    ))
-    .fetch_one(pool)
-    .await?;
-
-    let content = if flagged == 0 {
+    let content = if lines.is_empty() {
+        // No failures — an all-clear liveness note (only on change or the daily tick).
         format!(
-            "📯 **Foghorn — all clear.** No flagged indexers and no new issues in the last 24h. Still on watch.\nFor more details — {}/foghorn",
+            "📯 **Foghorn — all clear.** No indexers are currently serving errors or behind. Still on watch.\nFor more details — {}/foghorn",
             DASHBOARD
         )
     } else {
-        format!(
-            "📯 **Foghorn — still on watch.** No new issues in the last 24h; {flagged} indexer{} currently flagged.\nFor more details — {}/foghorn",
-            if flagged == 1 { "" } else { "s" },
-            DASHBOARD
-        )
+        // Full roster. Mark a no-change daily repost as a status check so an
+        // identical re-post doesn't look like a glitch.
+        let n = lines.len();
+        let header = if changed {
+            format!("📯 **Foghorn — {} indexer{} need attention**", n, plural(n as i64))
+        } else {
+            format!("📯 **Foghorn — daily status · {} indexer{} need attention**", n, plural(n as i64))
+        };
+        build_message_body(&header, &lines)
     };
 
-    let body = json!({ "username": "Foghorn", "content": content, "allowed_mentions": { "parse": [] } });
-    let resp = client.post(webhook).json(&body).send().await?;
-    if !resp.status().is_success() {
-        warn!(status = %resp.status(), "Discord webhook rejected the heartbeat");
-        return Ok(());
+    if !post_chunks(client, webhook, &content).await? {
+        return Ok(()); // webhook rejected — leave fingerprint untouched, retry next cycle
     }
-    touch_last_post(pool).await?;
-    info!("Posted liveness heartbeat to Discord");
+
+    sqlx::query("UPDATE alerter_state SET last_post = NOW(), last_fingerprint = $1")
+        .bind(&signature)
+        .execute(pool)
+        .await?;
+    info!(indexers = lines.len(), changed, "Posted failure roster to Discord");
     Ok(())
 }
 
-/// Record that we just posted to Discord, resetting the heartbeat timer.
-async fn touch_last_post(pool: &PgPool) -> Result<()> {
-    sqlx::query("UPDATE alerter_state SET last_post = NOW()")
-        .execute(pool)
-        .await?;
-    Ok(())
+fn plural(n: i64) -> &'static str {
+    if n == 1 { "" } else { "s" }
 }
 
 #[derive(Default)]
@@ -111,20 +102,18 @@ struct IndexerAlert {
     behind_head: bool,
 }
 
-async fn alert_once(client: &reqwest::Client, webhook: &str, pool: &PgPool) -> Result<usize> {
+/// The full set of currently-failing indexers, one summary line each, sorted
+/// deterministically (so the signature is stable across cycles).
+async fn current_failure_lines(pool: &PgPool) -> Result<Vec<String>> {
     let rows = sqlx::query(&format!(
         r#"SELECT a.indexer_address, a.kind, a.severity, a.detail,
                   COALESCE(p.ens_name, a.indexer_address) AS label
            FROM attention_item a
            LEFT JOIN indexer_profile p ON p.indexer_address = a.indexer_address
-           WHERE a.alerted_at IS NULL AND {ALERT_FILTER}"#
+           WHERE {ALERT_FILTER}"#
     ))
     .fetch_all(pool)
     .await?;
-
-    if rows.is_empty() {
-        return Ok(0);
-    }
 
     // Group every issue under its indexer — one line per indexer, nothing hidden.
     let mut by: HashMap<String, IndexerAlert> = HashMap::new();
@@ -153,34 +142,49 @@ async fn alert_once(client: &reqwest::Client, webhook: &str, pool: &PgPool) -> R
     }
 
     let mut alerts: Vec<IndexerAlert> = by.into_values().collect();
-    alerts.sort_by(|a, b| b.critical.cmp(&a.critical).then(b.serving_err_deps.cmp(&a.serving_err_deps)));
-    let plural = |n: i64| if n == 1 { "" } else { "s" };
+    // Critical first, then by serving-error breadth, then label — fully deterministic.
+    alerts.sort_by(|a, b| {
+        b.critical
+            .cmp(&a.critical)
+            .then(b.serving_err_deps.cmp(&a.serving_err_deps))
+            .then(a.label.cmp(&b.label))
+    });
 
-    let lines: Vec<String> = alerts.iter().map(|a| {
-        let emoji = if a.critical { "🔴" } else { "🟠" };
-        let mut parts: Vec<String> = Vec::new();
-        if a.serving_no_data {
-            parts.push("serving no data".to_string());
-        }
-        if a.serving_err_deps > 0 {
-            parts.push(format!("serving errors on {} deployment{}", a.serving_err_deps, plural(a.serving_err_deps)));
-        }
-        if a.behind_deps > 0 {
-            parts.push(format!("behind on {} deployment{}", a.behind_deps, plural(a.behind_deps)));
-        }
-        if a.behind_head {
-            parts.push("behind chainhead".to_string());
-        }
-        format!("{emoji} **{}** — {}", a.label, parts.join("; "))
-    }).collect();
+    Ok(alerts
+        .iter()
+        .map(|a| {
+            let emoji = if a.critical { "🔴" } else { "🟠" };
+            let mut parts: Vec<String> = Vec::new();
+            if a.serving_no_data {
+                parts.push("serving no data".to_string());
+            }
+            if a.serving_err_deps > 0 {
+                parts.push(format!("serving errors on {} deployment{}", a.serving_err_deps, plural(a.serving_err_deps)));
+            }
+            if a.behind_deps > 0 {
+                parts.push(format!("behind on {} deployment{}", a.behind_deps, plural(a.behind_deps)));
+            }
+            if a.behind_head {
+                parts.push("behind chainhead".to_string());
+            }
+            format!("{emoji} **{}** — {}", a.label, parts.join("; "))
+        })
+        .collect())
+}
 
-    // Chunk into messages under Discord's limit — show ALL, never truncate.
-    let header = format!("📯 **Foghorn — {} indexer{} need attention**", alerts.len(), plural(alerts.len() as i64));
+/// Header + all lines + footer, joined (caller chunks it for Discord's limit).
+fn build_message_body(header: &str, lines: &[String]) -> String {
     let footer = format!("For more details — {}/foghorn", DASHBOARD);
+    format!("{header}\n{}\n{footer}", lines.join("\n"))
+}
+
+/// Post `content`, splitting on newlines into messages under Discord's char cap.
+/// Returns false (without erroring) if the webhook rejects a chunk.
+async fn post_chunks(client: &reqwest::Client, webhook: &str, content: &str) -> Result<bool> {
     let mut messages: Vec<String> = Vec::new();
     let mut cur = String::new();
-    for line in &lines {
-        if cur.len() + line.len() + 1 > MSG_LIMIT {
+    for line in content.split('\n') {
+        if !cur.is_empty() && cur.len() + line.len() + 1 > MSG_LIMIT {
             messages.push(std::mem::take(&mut cur));
         }
         if !cur.is_empty() {
@@ -191,30 +195,15 @@ async fn alert_once(client: &reqwest::Client, webhook: &str, pool: &PgPool) -> R
     if !cur.is_empty() {
         messages.push(cur);
     }
-    if let Some(first) = messages.first_mut() {
-        *first = format!("{header}\n{first}");
-    }
-    if let Some(last) = messages.last_mut() {
-        last.push_str(&format!("\n{footer}"));
-    }
 
-    // Post every chunk; if any fails, leave alerted_at NULL to retry next cycle.
     for msg in &messages {
         let body = json!({ "username": "Foghorn", "content": msg, "allowed_mentions": { "parse": [] } });
         let resp = client.post(webhook).json(&body).send().await?;
         if !resp.status().is_success() {
-            warn!(status = %resp.status(), "Discord webhook rejected the alert");
-            return Ok(0);
+            warn!(status = %resp.status(), "Discord webhook rejected the message");
+            return Ok(false);
         }
         tokio::time::sleep(Duration::from_millis(400)).await; // be kind to the rate limit
     }
-
-    sqlx::query(&format!(
-        "UPDATE attention_item SET alerted_at = NOW() WHERE alerted_at IS NULL AND {ALERT_FILTER}"
-    ))
-    .execute(pool)
-    .await?;
-    touch_last_post(pool).await?; // a real alert resets the 24h heartbeat timer
-
-    Ok(alerts.len())
+    Ok(true)
 }
