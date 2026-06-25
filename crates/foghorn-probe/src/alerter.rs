@@ -31,13 +31,74 @@ pub async fn run_alert_loop(webhook: String, pool: PgPool) {
         }
     };
     loop {
-        match alert_once(&client, &webhook, &pool).await {
-            Ok(n) if n > 0 => info!(alerted = n, "Pushed alerts to Discord"),
-            Ok(_) => {}
-            Err(e) => warn!(error = %e, "Alert cycle failed"),
+        if let Err(e) = run_cycle(&client, &webhook, &pool).await {
+            warn!(error = %e, "Alert cycle failed");
         }
         tokio::time::sleep(Duration::from_secs(POLL_SECS)).await;
     }
+}
+
+/// One poll cycle: push new issues if any, otherwise a daily liveness heartbeat.
+async fn run_cycle(client: &reqwest::Client, webhook: &str, pool: &PgPool) -> Result<()> {
+    let n = alert_once(client, webhook, pool).await?;
+    if n > 0 {
+        info!(alerted = n, "Pushed alerts to Discord");
+    } else {
+        maybe_heartbeat(client, webhook, pool).await?;
+    }
+    Ok(())
+}
+
+/// Post a "still on watch" heartbeat when there's nothing new AND it's been >24h
+/// since we last posted anything (alert or heartbeat). Proves the alerter is
+/// alive on quiet days without spamming on restarts or routine quiet cycles.
+async fn maybe_heartbeat(client: &reqwest::Client, webhook: &str, pool: &PgPool) -> Result<()> {
+    let due: bool = sqlx::query_scalar(
+        "SELECT last_post IS NULL OR last_post < NOW() - INTERVAL '24 hours' FROM alerter_state",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap_or(true);
+    if !due {
+        return Ok(());
+    }
+
+    let flagged: i64 = sqlx::query_scalar(&format!(
+        "SELECT COUNT(DISTINCT indexer_address) FROM attention_item WHERE {ALERT_FILTER}"
+    ))
+    .fetch_one(pool)
+    .await?;
+
+    let content = if flagged == 0 {
+        format!(
+            "📯 **Foghorn — all clear.** No flagged indexers and no new issues in the last 24h. Still on watch.\nFor more details — {}/foghorn",
+            DASHBOARD
+        )
+    } else {
+        format!(
+            "📯 **Foghorn — still on watch.** No new issues in the last 24h; {flagged} indexer{} currently flagged.\nFor more details — {}/foghorn",
+            if flagged == 1 { "" } else { "s" },
+            DASHBOARD
+        )
+    };
+
+    let body = json!({ "username": "Foghorn", "content": content, "allowed_mentions": { "parse": [] } });
+    let resp = client.post(webhook).json(&body).send().await?;
+    if !resp.status().is_success() {
+        warn!(status = %resp.status(), "Discord webhook rejected the heartbeat");
+        return Ok(());
+    }
+    touch_last_post(pool).await?;
+    info!("Posted liveness heartbeat to Discord");
+    Ok(())
+}
+
+/// Record that we just posted to Discord, resetting the heartbeat timer.
+async fn touch_last_post(pool: &PgPool) -> Result<()> {
+    sqlx::query("UPDATE alerter_state SET last_post = NOW()")
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 #[derive(Default)]
@@ -153,6 +214,7 @@ async fn alert_once(client: &reqwest::Client, webhook: &str, pool: &PgPool) -> R
     ))
     .execute(pool)
     .await?;
+    touch_last_post(pool).await?; // a real alert resets the 24h heartbeat timer
 
     Ok(alerts.len())
 }
