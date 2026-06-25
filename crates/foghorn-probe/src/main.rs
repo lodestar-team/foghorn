@@ -4,6 +4,7 @@ use foghorn_core::{
 };
 use tracing::info;
 
+mod alerter;
 mod autodiscover;
 mod cluster;
 mod discovery;
@@ -56,6 +57,14 @@ async fn main() -> anyhow::Result<()> {
         let api_key = config.gateway.as_ref().map(|g| g.api_key.clone());
         let pool = pool.clone();
         tokio::spawn(async move { scorer::run_score_loop(scoring, api_key, pool).await });
+    }
+
+    // Discord alerting — push new critical needs-attention items to #foghorn-alerts.
+    if let Some(webhook) = config.alert_webhook.clone().filter(|w| !w.is_empty()) {
+        let pool = pool.clone();
+        tokio::spawn(async move { alerter::run_alert_loop(webhook, pool).await });
+    } else {
+        info!("No alert_webhook configured — Discord alerting disabled");
     }
 
     scheduler::run_probe_scheduler(config, pool).await?;

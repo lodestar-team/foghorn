@@ -153,6 +153,9 @@ pub struct FoghornConfig {
     pub lodestar: Option<LodestarConfig>,
     pub scoring: ScoringConfig,
     pub status_probe: StatusProbeConfig,
+    /// Discord webhook URL for #foghorn-alerts. When set, new critical
+    /// needs-attention items are pushed to Discord. Empty = alerting disabled.
+    pub alert_webhook: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -183,6 +186,7 @@ impl Default for FoghornConfig {
             lodestar: None,
             scoring: ScoringConfig::default(),
             status_probe: StatusProbeConfig::default(),
+            alert_webhook: None,
         }
     }
 }
