@@ -9,6 +9,7 @@ use chrono::Utc;
 use foghorn_core::config::LodestarConfig;
 use serde_json::{json, Value};
 use sqlx::PgPool;
+use std::collections::HashMap;
 use std::time::Duration;
 use tokio::task::JoinSet;
 use tracing::{info, warn};
@@ -19,7 +20,11 @@ const QOS_CONCURRENCY: usize = 6;
 // QoS oracle (Edge & Node) — per-allocation (indexer × deployment) daily metrics.
 const QOS_ORACLE_ID: &str = "Dtr9rETvwokot4BSXaD5tECanXfqfJKcvHuaaEgPDD2D";
 const QOS_ORACLE_BASE: &str = "https://gateway-arbitrum.network.thegraph.com/api";
-const ALLOC_MIN_QUERIES: i64 = 10; // ignore only near-zero-traffic allocations
+const ALLOC_MIN_QUERIES: i64 = 10; // ignore only near-zero-traffic allocations (per day)
+// Trailing window (oracle days) the per-allocation QoS is aggregated over. The
+// latest day is published live and fills through the day, so a single-day read
+// makes the erroring-set flap; a few settled days anchor it to persistent failure.
+const ALLOC_WINDOW_DAYS: i64 = 3;
 
 pub async fn run_ingest_loop(cfg: LodestarConfig, api_key: Option<String>, pool: PgPool) {
     info!(base_url = %cfg.base_url, interval = cfg.ingest_interval_secs, "Lodestar ingest loop starting");
@@ -47,9 +52,13 @@ pub async fn run_ingest_loop(cfg: LodestarConfig, api_key: Option<String>, pool:
     }
 }
 
-/// Ingest per-(indexer, deployment) QoS from the oracle's AllocationDailyDataPoint
-/// for the latest day — the granularity that reveals "synced but serving errors
-/// on subgraph X". Returns rows stored.
+/// Per-(indexer, deployment) QoS aggregated over a TRAILING WINDOW of the latest
+/// few oracle days, query-weighted — the granularity that reveals "synced but
+/// serving errors on subgraph X". Aggregating the window (rather than the single
+/// latest day) stabilises the erroring-set: the current day is published live and
+/// fills through the day, so a single-day read makes deployments flap in and out
+/// as counts accumulate. The window's settled prior days anchor the figure, so the
+/// signal reflects *persistent* failure, not mid-day noise. Returns rows stored.
 async fn ingest_allocation_qos(api_key: &str, pool: &PgPool) -> Result<usize> {
     let run_start = Utc::now();
     let url = format!("{}/{}/subgraphs/id/{}", QOS_ORACLE_BASE, api_key, QOS_ORACLE_ID);
@@ -68,13 +77,24 @@ async fn ingest_allocation_qos(api_key: &str, pool: &PgPool) -> Result<usize> {
     if max_day == 0 {
         return Ok(0);
     }
+    let min_day = max_day - (ALLOC_WINDOW_DAYS - 1);
 
-    let mut stored = 0usize;
+    // Accumulate query-weighted success per (indexer, deployment) over the window;
+    // blocks-behind takes the most recent day's value.
+    #[derive(Default)]
+    struct AllocAgg {
+        succ_weighted: f64,
+        query_sum: i64,
+        latest_day: i64,
+        latest_bb: f64,
+    }
+    let mut agg: HashMap<(String, String), AllocAgg> = HashMap::new();
+
     let mut last_id = String::new();
-    for _ in 0..15 {
+    for _ in 0..60 {
         let q = json!({
             "query": format!(
-                r#"{{ allocationDailyDataPoints(first: 1000, orderBy: id, orderDirection: asc, where: {{ dayNumber_gte: {max_day}, query_count_gte: "{ALLOC_MIN_QUERIES}", id_gt: "{last_id}" }}) {{ id indexer_wallet query_count proportion_indexer_200_responses avg_indexer_blocks_behind subgraphDeployment {{ id }} }} }}"#
+                r#"{{ allocationDailyDataPoints(first: 1000, orderBy: id, orderDirection: asc, where: {{ dayNumber_gte: {min_day}, query_count_gte: "{ALLOC_MIN_QUERIES}", id_gt: "{last_id}" }}) {{ id dayNumber indexer_wallet query_count proportion_indexer_200_responses avg_indexer_blocks_behind subgraphDeployment {{ id }} }} }}"#
             )
         });
         let v: Value = client.post(&url).json(&q).send().await?.json().await?;
@@ -88,19 +108,19 @@ async fn ingest_allocation_qos(api_key: &str, pool: &PgPool) -> Result<usize> {
             if indexer.is_empty() || dep.is_empty() {
                 continue;
             }
+            let day: i64 = r["dayNumber"].as_str().and_then(|s| s.parse().ok())
+                .or_else(|| r["dayNumber"].as_i64())
+                .unwrap_or(0);
             let qc: i64 = r["query_count"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0);
             let sr: f64 = r["proportion_indexer_200_responses"].as_str().and_then(|s| s.parse().ok()).unwrap_or(1.0);
             let bb: f64 = r["avg_indexer_blocks_behind"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0.0);
-            sqlx::query(
-                r#"INSERT INTO allocation_qos (indexer_address, deployment_id, day_number, success_rate, blocks_behind, query_count, updated_at)
-                   VALUES ($1,$2,$3,$4,$5,$6, NOW())
-                   ON CONFLICT (indexer_address, deployment_id) DO UPDATE SET
-                     day_number = EXCLUDED.day_number, success_rate = EXCLUDED.success_rate,
-                     blocks_behind = EXCLUDED.blocks_behind, query_count = EXCLUDED.query_count, updated_at = NOW()"#,
-            )
-            .bind(&indexer).bind(&dep).bind(max_day as i32).bind(sr).bind(bb).bind(qc)
-            .execute(pool).await?;
-            stored += 1;
+            let e = agg.entry((indexer, dep)).or_default();
+            e.succ_weighted += sr * qc as f64;
+            e.query_sum += qc;
+            if day >= e.latest_day {
+                e.latest_day = day;
+                e.latest_bb = bb;
+            }
         }
         if rows.len() < 1000 {
             break;
@@ -109,6 +129,26 @@ async fn ingest_allocation_qos(api_key: &str, pool: &PgPool) -> Result<usize> {
         if last_id.is_empty() {
             break;
         }
+    }
+
+    // Upsert the windowed aggregate. query_count is the window sum; success_rate is
+    // query-weighted across the window; blocks_behind is the most recent day's value.
+    let mut stored = 0usize;
+    for ((indexer, dep), a) in &agg {
+        if a.query_sum <= 0 {
+            continue;
+        }
+        let sr = a.succ_weighted / a.query_sum as f64;
+        sqlx::query(
+            r#"INSERT INTO allocation_qos (indexer_address, deployment_id, day_number, success_rate, blocks_behind, query_count, updated_at)
+               VALUES ($1,$2,$3,$4,$5,$6, NOW())
+               ON CONFLICT (indexer_address, deployment_id) DO UPDATE SET
+                 day_number = EXCLUDED.day_number, success_rate = EXCLUDED.success_rate,
+                 blocks_behind = EXCLUDED.blocks_behind, query_count = EXCLUDED.query_count, updated_at = NOW()"#,
+        )
+        .bind(indexer).bind(dep).bind(max_day as i32).bind(sr).bind(a.latest_bb).bind(a.query_sum)
+        .execute(pool).await?;
+        stored += 1;
     }
 
     // Drop rows not refreshed this run (allocation closed or traffic dried up).
