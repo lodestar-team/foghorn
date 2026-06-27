@@ -44,6 +44,14 @@ pub async fn run_alert_loop(webhook: String, pool: PgPool) {
 async fn run_cycle(client: &reqwest::Client, webhook: &str, pool: &PgPool) -> Result<()> {
     let roster = current_failure_roster(pool).await?;
 
+    // Advance the hysteresis machine and get the debounced fingerprint. Change
+    // detection is on this committed roster+severity, NOT exact counts and NOT
+    // single-cycle flicker — so a count drift (26→27), a long-tail indexer blinking
+    // in for one cycle, or a one-cycle severity flip won't re-ping the channel. Only
+    // a sustained new failure, recovery, or severity change does. The posted message
+    // still carries the full live roster, and the daily digest refreshes it anyway.
+    let fingerprint = debounced_fingerprint(pool, &roster.states).await?;
+
     // Read last-posted fingerprint + whether 24h has elapsed (daily liveness repost).
     let (last_fingerprint, due): (Option<String>, bool) = sqlx::query_as(
         "SELECT last_fingerprint, (last_post IS NULL OR last_post < NOW() - INTERVAL '24 hours') FROM alerter_state",
@@ -52,11 +60,7 @@ async fn run_cycle(client: &reqwest::Client, webhook: &str, pool: &PgPool) -> Re
     .await
     .unwrap_or((None, true));
 
-    // Change detection is on the roster + severity, NOT the exact counts — so an
-    // indexer drifting 26→27 deployments doesn't re-ping the channel; only a new
-    // failing indexer, a recovery, or a severity change does. The posted message
-    // still carries live counts, and the daily digest refreshes them regardless.
-    let changed = roster.fingerprint != last_fingerprint.unwrap_or_default();
+    let changed = fingerprint != last_fingerprint.unwrap_or_default();
     if !changed && !due {
         return Ok(()); // roster unchanged and not yet time for the daily digest
     }
@@ -85,7 +89,7 @@ async fn run_cycle(client: &reqwest::Client, webhook: &str, pool: &PgPool) -> Re
     }
 
     sqlx::query("UPDATE alerter_state SET last_post = NOW(), last_fingerprint = $1")
-        .bind(&roster.fingerprint)
+        .bind(&fingerprint)
         .execute(pool)
         .await?;
     info!(indexers = lines.len(), changed, "Posted failure roster to Discord");
@@ -109,8 +113,9 @@ struct IndexerAlert {
 struct Roster {
     /// One human-readable summary line per failing indexer (with live counts).
     lines: Vec<String>,
-    /// Coarse change-detection signature: sorted `address:severity`, no counts.
-    fingerprint: String,
+    /// Raw observed (address, severity 'C'|'H') for this cycle — fed to the
+    /// hysteresis debounce, which decides what actually moves the trigger.
+    states: Vec<(String, String)>,
 }
 
 /// The full set of currently-failing indexers: display lines (with counts) plus a
@@ -152,14 +157,12 @@ async fn current_failure_roster(pool: &PgPool) -> Result<Roster> {
         }
     }
 
-    // Fingerprint = sorted address:severity, independent of counts and display
-    // order, so only roster/severity changes flip it (not a count drift or reorder).
-    let mut fp: Vec<String> = by
+    // Raw observed states (address, severity), independent of counts — the
+    // hysteresis debounce in run_cycle turns these into the committed fingerprint.
+    let states: Vec<(String, String)> = by
         .iter()
-        .map(|(addr, a)| format!("{}:{}", addr, if a.critical { "C" } else { "H" }))
+        .map(|(addr, a)| (addr.clone(), if a.critical { "C" } else { "H" }.to_string()))
         .collect();
-    fp.sort();
-    let fingerprint = fp.join(",");
 
     let mut alerts: Vec<IndexerAlert> = by.into_values().collect();
     // Critical first, then by serving-error breadth, then label — fully deterministic.
@@ -191,7 +194,90 @@ async fn current_failure_roster(pool: &PgPool) -> Result<Roster> {
         })
         .collect();
 
-    Ok(Roster { lines, fingerprint })
+    Ok(Roster { lines, states })
+}
+
+/// Cycles a new per-indexer state must hold before it moves the trigger
+/// fingerprint. At the hourly cadence, 2 ≈ "stable for ~2h" — enough to swallow
+/// the long-tail flicker (a single erroring deployment blinking past the volume
+/// floor) and one-cycle severity flips, without delaying genuine changes much.
+const CONFIRM_CYCLES: i32 = 2;
+
+/// Advance the hysteresis state machine with this cycle's raw observations and
+/// return the committed (debounced) fingerprint — sorted `address:severity` over
+/// indexers whose state has settled. Transient flickers never reach the threshold,
+/// so they don't change the fingerprint and don't trigger a post.
+async fn debounced_fingerprint(pool: &PgPool, states: &[(String, String)]) -> Result<String> {
+    use std::collections::HashMap as Map;
+    let observed: Map<&str, &str> = states.iter().map(|(a, s)| (a.as_str(), s.as_str())).collect();
+
+    // Existing member state.
+    let rows = sqlx::query("SELECT indexer_address, stable_state, candidate_state, streak FROM alert_member")
+        .fetch_all(pool)
+        .await?;
+    let mut members: Map<String, (String, String, i32)> = Map::new();
+    for r in &rows {
+        members.insert(
+            r.get("indexer_address"),
+            (r.get("stable_state"), r.get("candidate_state"), r.get("streak")),
+        );
+    }
+
+    // Union of observed + known addresses.
+    let mut addrs: Vec<String> = members.keys().cloned().collect();
+    for (a, _) in states {
+        if !members.contains_key(a) {
+            addrs.push(a.clone());
+        }
+    }
+
+    let mut committed: Vec<String> = Vec::new();
+    for addr in &addrs {
+        let obs = observed.get(addr.as_str()).copied().unwrap_or("absent");
+        let (mut stable, mut candidate, mut streak) = members
+            .get(addr)
+            .cloned()
+            .unwrap_or_else(|| ("absent".to_string(), "absent".to_string(), 0));
+
+        if obs == stable {
+            // Reverted to the committed state before confirming a change.
+            candidate = obs.to_string();
+            streak = 0;
+        } else if obs == candidate {
+            streak += 1;
+            if streak >= CONFIRM_CYCLES {
+                stable = obs.to_string(); // confirmed — commit it
+                streak = 0;
+            }
+        } else {
+            candidate = obs.to_string(); // new candidate, restart the count
+            streak = 1;
+        }
+
+        if stable == "absent" && candidate == "absent" {
+            sqlx::query("DELETE FROM alert_member WHERE indexer_address = $1")
+                .bind(addr)
+                .execute(pool)
+                .await?;
+        } else {
+            sqlx::query(
+                r#"INSERT INTO alert_member (indexer_address, stable_state, candidate_state, streak, updated_at)
+                   VALUES ($1,$2,$3,$4, NOW())
+                   ON CONFLICT (indexer_address) DO UPDATE SET
+                     stable_state = EXCLUDED.stable_state, candidate_state = EXCLUDED.candidate_state,
+                     streak = EXCLUDED.streak, updated_at = NOW()"#,
+            )
+            .bind(addr).bind(&stable).bind(&candidate).bind(streak)
+            .execute(pool)
+            .await?;
+            if stable != "absent" {
+                committed.push(format!("{addr}:{stable}"));
+            }
+        }
+    }
+
+    committed.sort();
+    Ok(committed.join(","))
 }
 
 /// Header + all lines + footer, joined (caller chunks it for Discord's limit).
