@@ -1022,6 +1022,10 @@ pub async fn qos_status(State(state): State<AppState>) -> Result<Json<Value>, St
                 // above. `last_bucket` and `last_computed` are context, not the freshness measure.
                 "age_seconds": age(last_measured),
                 "last_measured": last_measured.map(|t| t.to_rfc3339()),
+                // The cadence this feed is actually configured to run at, so a consumer can judge
+                // staleness relative to it instead of against an assumed number. Probing hourly
+                // means an age of 50 minutes is normal, not a fault.
+                "expected_interval_seconds": state.probe_interval_secs,
                 "last_bucket": bucket.map(|t| t.to_rfc3339()),
                 "last_computed": computed.map(|t| t.to_rfc3339()),
                 "note": "measured locally; no external publisher in the path",

@@ -13,6 +13,13 @@ mod routes;
 #[derive(Clone)]
 pub struct AppState {
     pub pool: sqlx::PgPool,
+    /// How often the probe scheduler runs, from the same config the probe binary reads.
+    ///
+    /// Staleness thresholds are derived from this rather than hardcoded. The page previously
+    /// declared the feed "lagging" after 15 minutes while the box was configured to probe hourly,
+    /// so it condemned its own feed for ~45 minutes of every hour. A cadence-relative threshold
+    /// cannot drift out of step with the deployment the way a guessed constant does.
+    pub probe_interval_secs: u64,
     /// The oracle-compatible GraphQL schema. Held in state rather than built per request because
     /// schema construction walks every resolver.
     pub schema: graphql::QosSchema,
@@ -36,6 +43,7 @@ async fn main() -> anyhow::Result<()> {
 
     let state = AppState {
         schema: graphql::schema(pool.clone()),
+        probe_interval_secs: config.probe_interval_secs,
         pool,
     };
 
