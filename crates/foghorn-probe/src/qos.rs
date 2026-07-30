@@ -62,7 +62,18 @@ pub async fn rollup_once(cfg: &QosRollupConfig, pool: &PgPool) -> Result<u64> {
         r#"
         WITH obs AS (
             SELECT
-                o.indexer_address,
+                -- `observation.indexer_address` is the ALLOCATION SIGNING KEY recovered from the
+                -- gateway's EIP-712 attestation, not the indexer. Publishing QoS keyed on it
+                -- produced a feed where 46 of 46 rows matched `allocation_map.allocation_key` and
+                -- none matched a real indexer: every address on the page was wrong, every
+                -- `indexer_url` was null, and the oracle comparison found 13 shared deployments
+                -- with zero shared indexers. Resolve it here.
+                --
+                -- INNER JOIN deliberately: an observation we cannot attribute to a real indexer is
+                -- dropped rather than published under a signing key. Attributing quality to the
+                -- wrong identity is a worse failure than missing a row, because a reader cannot
+                -- tell it happened.
+                m.indexer_address,
                 p.deployment_id,
                 to_timestamp(floor(extract(epoch FROM p.dispatched_at) / $1) * $1) AS bucket_start,
                 o.latency_ms,
@@ -71,6 +82,9 @@ pub async fn rollup_once(cfg: &QosRollupConfig, pool: &PgPool) -> Result<u64> {
                 d.largest_by_stake_hash
             FROM observation o
             JOIN probe p ON p.id = o.probe_id
+            JOIN allocation_map m
+              ON m.allocation_key = o.indexer_address
+             AND m.indexer_address IS NOT NULL
             LEFT JOIN divergence d ON d.probe_id = o.probe_id
             WHERE p.dispatched_at >= NOW() - make_interval(secs => $2)
         ),
