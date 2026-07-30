@@ -84,6 +84,21 @@ pub async fn rollup_once(cfg: &QosRollupConfig, pool: &PgPool) -> Result<u64> {
                 -- one is not a majority, and judging against it is what produced a public claim
                 -- that a named indexer served wrong data on a sample where nothing was compared.
                 d.largest_by_count_size AS majority_size,
+                -- Chainhead lag, derived from data we already collect. `freshness_sample` exists in
+                -- the schema but NOTHING in the codebase ever inserted into it, so this column was
+                -- null on every row while the page advertised it as one of two trustworthy fields.
+                --
+                -- `probe.block_number` is chainhead − $6 at probe creation, so chainhead at that
+                -- moment is `block_number + $6`, and `observation.meta_block_number` is the head the
+                -- indexer reported. Clamped at zero because the reference is a few seconds stale
+                -- (Arbitrum blocks are sub-second), which routinely makes a current indexer look
+                -- microscopically "ahead". The consequence is a conservative metric: it cannot
+                -- resolve lag smaller than that staleness, but the case that matters — an indexer
+                -- hundreds or thousands of blocks behind — measures cleanly.
+                CASE WHEN o.meta_block_number IS NOT NULL
+                     THEN GREATEST(0, (p.block_number + $6) - o.meta_block_number)::double precision
+                     ELSE NULL
+                END AS blocks_behind,
                 -- Deployments that diverge every round are the subgraph's fault, not an indexer's.
                 (nd.deployment_id IS NOT NULL) AS nondeterministic
             FROM observation o
@@ -119,6 +134,8 @@ pub async fn rollup_once(cfg: &QosRollupConfig, pool: &PgPool) -> Result<u64> {
                 -- non-deterministic. Without those conditions a probe answered by a single indexer
                 -- yielded `comparable=1, divergent=1` — a minority of one, with no majority to
                 -- differ from — and published it as "serving wrong data" against a named operator.
+                avg(blocks_behind)                           AS avg_blocks_behind,
+                max(blocks_behind)                           AS max_blocks_behind,
                 count(*) FILTER (
                     WHERE response_hash IS NOT NULL
                       AND largest_by_stake_hash IS NOT NULL
@@ -133,17 +150,6 @@ pub async fn rollup_once(cfg: &QosRollupConfig, pool: &PgPool) -> Result<u64> {
                       AND response_hash <> largest_by_stake_hash
                 )                                            AS divergent_count
             FROM obs
-            GROUP BY 1, 2, 3
-        ),
-        fresh AS (
-            SELECT
-                indexer_address,
-                deployment_id,
-                to_timestamp(floor(extract(epoch FROM sampled_at) / $1) * $1) AS bucket_start,
-                avg(chainhead_lag_blocks::double precision) AS avg_blocks_behind,
-                max(chainhead_lag_blocks::double precision) AS max_blocks_behind
-            FROM freshness_sample
-            WHERE sampled_at >= NOW() - make_interval(secs => $2)
             GROUP BY 1, 2, 3
         ),
         -- allocation_map is keyed per allocation, so an indexer appears once per allocation.
@@ -183,8 +189,8 @@ pub async fn rollup_once(cfg: &QosRollupConfig, pool: &PgPool) -> Result<u64> {
             a.p50::int,
             a.p95::int,
             a.p99::int,
-            f.avg_blocks_behind,
-            f.max_blocks_behind,
+            a.avg_blocks_behind,
+            a.max_blocks_behind,
             a.comparable_count,
             a.divergent_count,
             CASE WHEN a.comparable_count > 0
@@ -194,10 +200,6 @@ pub async fn rollup_once(cfg: &QosRollupConfig, pool: &PgPool) -> Result<u64> {
             END,
             NOW()
         FROM agg a
-        LEFT JOIN fresh f
-               ON f.indexer_address = a.indexer_address
-              AND f.deployment_id   = a.deployment_id
-              AND f.bucket_start    = a.bucket_start
         LEFT JOIN urls u ON u.indexer_address = a.indexer_address
         ON CONFLICT (indexer_address, deployment_id, bucket_start, bucket_secs) DO UPDATE SET
             indexer_url                      = EXCLUDED.indexer_url,
@@ -225,6 +227,7 @@ pub async fn rollup_once(cfg: &QosRollupConfig, pool: &PgPool) -> Result<u64> {
     .bind(cfg.bucket_secs as i32)
     .bind(&cfg.chain_id)
     .bind(&cfg.gateway_id)
+    .bind(cfg.chainhead_offset as i64)
     .execute(pool)
     .await?;
 

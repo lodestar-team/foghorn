@@ -169,6 +169,10 @@ pub struct QosRollupConfig {
     pub gateway_id: String,
     /// Stamped onto every row as the oracle's `chain_id`.
     pub chain_id: String,
+    /// How far below chainhead probes are pinned. Chainhead at probe time is
+    /// `probe.block_number + this`, which is the reference blocks-behind is measured against. Must
+    /// match `reorg_threshold`, which is what the scheduler pins with.
+    pub chainhead_offset: u64,
 }
 
 impl Default for QosRollupConfig {
@@ -180,6 +184,7 @@ impl Default for QosRollupConfig {
             lookback_secs: 3600,
             gateway_id: "lodestar".to_string(),
             chain_id: "arbitrum-one".to_string(),
+            chainhead_offset: 12,
         }
     }
 }
