@@ -34,7 +34,7 @@
 use async_graphql::{Context, EmptyMutation, EmptySubscription, Enum, InputObject, Object, Schema};
 use sqlx::{postgres::PgRow, PgPool, Row};
 
-use crate::qos::{daily_points, DailyFilter, DailyOrder};
+use crate::qos::{points_for, DailyFilter, DailyOrder, Feed};
 
 pub type QosSchema = Schema<QueryRoot, EmptyMutation, EmptySubscription>;
 
@@ -105,9 +105,19 @@ pub struct AllocationDailyDataPointFilter {
     pub indexer_wallet: Option<String>,
     #[graphql(name = "subgraph_deployment_ipfs_hash")]
     pub subgraph_deployment_ipfs_hash: Option<String>,
+    /// Selects the feed. Absent or anything other than "lodestar"/"foghorn" returns the CANONICAL
+    /// oracle data from Lodestar's mirror — a consumer repointing an existing query must get the
+    /// numbers it already had, not our probe measurements under the same field names.
+    #[graphql(name = "gateway_id")]
+    pub gateway_id: Option<String>,
 }
 
 impl AllocationDailyDataPointFilter {
+    /// Which feed this filter asks for, read before `apply` consumes it.
+    fn feed(&self) -> Feed {
+        Feed::from_gateway_id(self.gateway_id.as_deref())
+    }
+
     fn apply(self, f: &mut DailyFilter) {
         f.day_eq = self.dayNumber;
         f.day_gte = self.dayNumber_gte;
@@ -218,18 +228,21 @@ impl AllocationDailyDataPoint {
         big(self.0.get("max_indexer_blocks_behind"))
     }
 
-    // Fees: null until probes are TAP-paid. See the module note.
+    // Fees are REAL on the canonical feed (the mirror carries the publisher's own figures) and
+    // absent on the measured feed until probes are TAP-paid. `try_get` covers both without
+    // branching: a column the measured query does not select resolves to null, which correctly
+    // means "not measured" rather than "free".
     #[graphql(name = "avg_query_fee")]
     async fn avg_query_fee(&self) -> Option<String> {
-        None
+        opt_num(&self.0, "avg_query_fee")
     }
     #[graphql(name = "max_query_fee")]
     async fn max_query_fee(&self) -> Option<String> {
-        None
+        opt_num(&self.0, "max_query_fee")
     }
     #[graphql(name = "total_query_fees")]
     async fn total_query_fees(&self) -> Option<String> {
-        None
+        opt_num(&self.0, "total_query_fees")
     }
 
     // ── Foghorn additions ──
@@ -267,6 +280,11 @@ impl AllocationDailyDataPoint {
     }
 }
 
+/// A numeric column that may not exist on this row at all, rendered as a string or null.
+fn opt_num(row: &PgRow, col: &str) -> Option<String> {
+    row.try_get::<Option<f64>, _>(col).ok().flatten().map(|v| v.to_string())
+}
+
 /// BigDecimal-as-string, with null rendered as "0" because the oracle's equivalents are non-null.
 fn big(v: Option<f64>) -> String {
     v.unwrap_or(0.0).to_string()
@@ -293,6 +311,7 @@ impl SubgraphDeployment {
         r#where: Option<AllocationDailyDataPointFilter>,
     ) -> async_graphql::Result<Vec<AllocationDailyDataPoint>> {
         let mut f = DailyFilter::for_deployment(&self.id);
+        let feed = r#where.as_ref().map(|w| w.feed()).unwrap_or(Feed::Canonical);
         if let Some(w) = r#where {
             w.apply(&mut f);
         }
@@ -301,7 +320,7 @@ impl SubgraphDeployment {
         f.deployment = Some(self.id.clone());
         f.order = order_of(order_by, order_direction);
         f.first_skip(first, skip);
-        fetch(ctx, f).await
+        fetch(ctx, feed, f).await
     }
 }
 
@@ -327,13 +346,14 @@ impl Indexer {
         r#where: Option<AllocationDailyDataPointFilter>,
     ) -> async_graphql::Result<Vec<AllocationDailyDataPoint>> {
         let mut f = DailyFilter::for_indexer(&self.id);
+        let feed = r#where.as_ref().map(|w| w.feed()).unwrap_or(Feed::Canonical);
         if let Some(w) = r#where {
             w.apply(&mut f);
         }
         f.indexer = Some(self.id.clone());
         f.order = order_of(order_by, order_direction);
         f.first_skip(first, skip);
-        fetch(ctx, f).await
+        fetch(ctx, feed, f).await
     }
 }
 
@@ -418,12 +438,13 @@ impl QueryRoot {
         r#where: Option<AllocationDailyDataPointFilter>,
     ) -> async_graphql::Result<Vec<AllocationDailyDataPoint>> {
         let mut f = DailyFilter::default();
+        let feed = r#where.as_ref().map(|w| w.feed()).unwrap_or(Feed::Canonical);
         if let Some(w) = r#where {
             w.apply(&mut f);
         }
         f.order = order_of(order_by, order_direction);
         f.first_skip(first, skip);
-        fetch(ctx, f).await
+        fetch(ctx, feed, f).await
     }
 
     async fn queryDailyDataPoints(
@@ -436,13 +457,14 @@ impl QueryRoot {
         r#where: Option<AllocationDailyDataPointFilter>,
     ) -> async_graphql::Result<Vec<QueryDailyDataPoint>> {
         let mut f = DailyFilter::default();
+        let feed = r#where.as_ref().map(|w| w.feed()).unwrap_or(Feed::Canonical);
         if let Some(w) = r#where {
             w.apply(&mut f);
         }
         f.order = order_of(order_by, order_direction);
         f.first_skip(first, skip);
         let pool = ctx.data::<PgPool>()?;
-        Ok(daily_points(pool, &f)
+        Ok(points_for(pool, feed, &f)
             .await
             .map_err(|e| async_graphql::Error::new(e.to_string()))?
             .into_iter()
@@ -508,10 +530,11 @@ impl FoghornStatus {
 
 async fn fetch(
     ctx: &Context<'_>,
+    feed: Feed,
     f: DailyFilter,
 ) -> async_graphql::Result<Vec<AllocationDailyDataPoint>> {
     let pool = ctx.data::<PgPool>()?;
-    Ok(daily_points(pool, &f)
+    Ok(points_for(pool, feed, &f)
         .await
         .map_err(|e| async_graphql::Error::new(e.to_string()))?
         .into_iter()

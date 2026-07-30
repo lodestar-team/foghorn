@@ -1018,6 +1018,127 @@ pub struct QosBucketParams {
     pub limit: Option<i64>,
 }
 
+/// The canonical oracle's own data, served from Lodestar's mirror.
+///
+/// This is the feed indexers actually want: Edge & Node's published numbers over real gateway
+/// traffic — genuine query counts, genuine fees, success rates measured on queries users actually
+/// sent. Foghorn's probe feed is a different thing and is served separately.
+///
+/// Serving it from here removes three dependencies from the read path: the gateway (no API key),
+/// the subgraph's indexers, and the oracle's own availability. What it cannot remove is the
+/// publisher: during a stall this mirror is as frozen as the source, which is why every response
+/// carries the publisher's true liveness read from Gnosis rather than our sync time.
+pub async fn qos_canonical(
+    State(state): State<AppState>,
+    Query(params): Query<QosCanonicalParams>,
+) -> Result<Json<Value>, StatusCode> {
+    let days: i32 = params.days.unwrap_or(1).clamp(1, 30);
+    let limit: i64 = params.limit.unwrap_or(1000).clamp(1, 5000);
+    let indexer = params.indexer.map(|s| s.to_lowercase());
+
+    let rows = sqlx::query(
+        r#"
+        WITH latest AS (SELECT max(day_number) AS d FROM oracle_allocation_daily)
+        SELECT
+            a.id, a.day_number, a.day_start, a.day_end, a.data_point_count,
+            a.indexer_wallet, a.indexer_url, a.subgraph_deployment_ipfs_hash,
+            a.chain_id, COALESCE(a.gateway_id, 'edgeandnode') AS gateway_id,
+            a.query_count::double precision                       AS query_count,
+            a.num_indexer_200_responses::double precision         AS num_indexer_200_responses,
+            a.proportion_indexer_200_responses::double precision  AS proportion_indexer_200_responses,
+            a.avg_indexer_latency_ms::double precision            AS avg_indexer_latency_ms,
+            a.max_indexer_latency_ms::double precision            AS max_indexer_latency_ms,
+            a.avg_indexer_blocks_behind::double precision         AS avg_indexer_blocks_behind,
+            a.max_indexer_blocks_behind::double precision         AS max_indexer_blocks_behind,
+            a.avg_query_fee::double precision                     AS avg_query_fee,
+            a.total_query_fees::double precision                  AS total_query_fees,
+            -- Share of the deployment's total traffic this indexer served. Requires the
+            -- gateway-wide per-deployment totals, so no probe-based feed can ever compute it.
+            CASE WHEN q.query_count > 0
+                 THEN (a.query_count / q.query_count)::double precision
+                 ELSE NULL
+            END                                                   AS served_share
+        FROM oracle_allocation_daily a
+        LEFT JOIN oracle_query_daily q
+               ON q.subgraph_deployment_ipfs_hash = a.subgraph_deployment_ipfs_hash
+              AND q.day_number = a.day_number
+        CROSS JOIN latest l
+        WHERE a.day_number > l.d - $1
+          AND ($2::text IS NULL OR a.indexer_wallet = $2)
+          AND ($3::text IS NULL OR a.subgraph_deployment_ipfs_hash = $3)
+        ORDER BY a.day_number DESC, a.query_count DESC
+        LIMIT $4
+        "#,
+    )
+    .bind(days)
+    .bind(&indexer)
+    .bind(&params.deployment)
+    .bind(limit)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let points: Vec<Value> = rows.iter().map(|r| json!({
+        "id": r.get::<String, _>("id"),
+        "dayNumber": r.get::<i32, _>("day_number"),
+        "dayStart": r.get::<Option<i64>, _>("day_start"),
+        "dayEnd": r.get::<Option<i64>, _>("day_end"),
+        "dataPointCount": r.get::<Option<i64>, _>("data_point_count"),
+        "indexer_wallet": r.get::<String, _>("indexer_wallet"),
+        "indexer_url": r.get::<Option<String>, _>("indexer_url"),
+        "subgraph_deployment_ipfs_hash": r.get::<String, _>("subgraph_deployment_ipfs_hash"),
+        "chain_id": r.get::<Option<String>, _>("chain_id"),
+        "gateway_id": r.get::<Option<String>, _>("gateway_id"),
+        "query_count": r.get::<Option<f64>, _>("query_count"),
+        "num_indexer_200_responses": r.get::<Option<f64>, _>("num_indexer_200_responses"),
+        "proportion_indexer_200_responses": r.get::<Option<f64>, _>("proportion_indexer_200_responses"),
+        "avg_indexer_latency_ms": r.get::<Option<f64>, _>("avg_indexer_latency_ms"),
+        "max_indexer_latency_ms": r.get::<Option<f64>, _>("max_indexer_latency_ms"),
+        "avg_indexer_blocks_behind": r.get::<Option<f64>, _>("avg_indexer_blocks_behind"),
+        "max_indexer_blocks_behind": r.get::<Option<f64>, _>("max_indexer_blocks_behind"),
+        "avg_query_fee": r.get::<Option<f64>, _>("avg_query_fee"),
+        "total_query_fees": r.get::<Option<f64>, _>("total_query_fees"),
+        "served_share": r.get::<Option<f64>, _>("served_share"),
+    })).collect();
+
+    // Publisher liveness, from the chain. Served alongside the data so a consumer can never read
+    // stale canonical numbers believing them current.
+    let (posted, lag): (Option<chrono::DateTime<chrono::Utc>>, Option<i32>) = sqlx::query_as(
+        "SELECT max(posted_at),
+                (SELECT lag_seconds FROM oracle_message ORDER BY posted_at DESC LIMIT 1)
+         FROM oracle_message",
+    )
+    .fetch_one(&state.pool)
+    .await
+    .unwrap_or((None, None));
+
+    Ok(Json(json!({
+        "source": "edgeandnode-qos-oracle",
+        "served_by": "lodestar-mirror",
+        "what": "Edge & Node's published QoS, mirrored. Real gateway traffic: genuine query counts, \
+                 fees and success rates — not probes.",
+        "publisher": {
+            "last_post": posted.map(|t| t.to_rfc3339()),
+            "age_seconds": posted.map(|t| (chrono::Utc::now() - t).num_seconds()),
+            "publish_lag_seconds": lag,
+            "measured_from": "DataEdge transactions on Gnosis",
+            "note": "During a publisher stall this mirror is as frozen as the source. The age above \
+                     is the truth about that; our sync time is not.",
+        },
+        "window_days": days,
+        "count": points.len(),
+        "allocationDailyDataPoints": points,
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct QosCanonicalParams {
+    pub days: Option<i32>,
+    pub indexer: Option<String>,
+    pub deployment: Option<String>,
+    pub limit: Option<i64>,
+}
+
 /// Agreement between Foghorn's measurements and the canonical oracle.
 ///
 /// This is the honesty check: if the two feeds disagree wildly, ours needs explaining before
