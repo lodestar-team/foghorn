@@ -976,6 +976,23 @@ pub async fn qos_status(State(state): State<AppState>) -> Result<Json<Value>, St
         .await
         .unwrap_or((None, None));
 
+    // Freshness is time since the last MEASUREMENT, not since the current bucket's lower edge.
+    //
+    // Using `bucket_start` made a perfectly healthy feed look minutes stale by construction — a
+    // 5-minute bucket is already 5 minutes "old" the instant before it closes — and after a restart
+    // it read as 17 minutes while probes were landing 9 seconds earlier. Using `computed_at` would
+    // be the opposite error: the rollup runs on a timer and would report freshness even if probing
+    // had stopped entirely, which is precisely the "absent renders as healthy" failure this page
+    // exists to complain about. The last probe that actually produced an observation is the only
+    // measure that goes stale when, and only when, measurement genuinely stops.
+    let last_measured: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
+        "SELECT max(p.dispatched_at) FROM probe p
+         WHERE EXISTS (SELECT 1 FROM observation o WHERE o.probe_id = p.id)",
+    )
+    .fetch_one(&state.pool)
+    .await
+    .unwrap_or(None);
+
     let now = chrono::Utc::now();
     let age = |t: Option<chrono::DateTime<chrono::Utc>>| {
         t.map(|t| (now - t).num_seconds()).map(Value::from).unwrap_or(Value::Null)
@@ -1001,9 +1018,12 @@ pub async fn qos_status(State(state): State<AppState>) -> Result<Json<Value>, St
             {
                 "source": "foghorn",
                 "gateway_id": "lodestar",
+                // Age is time since the last probe that produced an observation — see the comment
+                // above. `last_bucket` and `last_computed` are context, not the freshness measure.
+                "age_seconds": age(last_measured),
+                "last_measured": last_measured.map(|t| t.to_rfc3339()),
                 "last_bucket": bucket.map(|t| t.to_rfc3339()),
                 "last_computed": computed.map(|t| t.to_rfc3339()),
-                "age_seconds": age(bucket),
                 "note": "measured locally; no external publisher in the path",
             },
         ],
