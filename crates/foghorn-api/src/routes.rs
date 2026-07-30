@@ -1038,7 +1038,20 @@ pub async fn qos_canonical(
 
     let rows = sqlx::query(
         r#"
-        WITH latest AS (SELECT max(day_number) AS d FROM oracle_allocation_daily)
+        WITH latest AS (SELECT max(day_number) AS d FROM oracle_allocation_daily),
+        -- Per-deployment totals of INDEXER ATTEMPTS, computed over the whole table rather than over
+        -- the filtered rows: partitioning the result set would make a single-indexer query report a
+        -- 100% share of itself.
+        --
+        -- The denominator must be attempts, not `oracle_query_daily.query_count`. Those count *user
+        -- queries* (topic gateway_query_result) while allocation rows count *indexer attempts*
+        -- (topic gateway_indexer_attempt), and the gateway retries across indexers — so dividing one
+        -- by the other yields values above 1.0, which is how this bug was caught.
+        totals AS (
+            SELECT subgraph_deployment_ipfs_hash, day_number, sum(query_count) AS attempts
+            FROM oracle_allocation_daily
+            GROUP BY 1, 2
+        )
         SELECT
             a.id, a.day_number, a.day_start, a.day_end, a.data_point_count,
             a.indexer_wallet, a.indexer_url, a.subgraph_deployment_ipfs_hash,
@@ -1052,13 +1065,21 @@ pub async fn qos_canonical(
             a.max_indexer_blocks_behind::double precision         AS max_indexer_blocks_behind,
             a.avg_query_fee::double precision                     AS avg_query_fee,
             a.total_query_fees::double precision                  AS total_query_fees,
-            -- Share of the deployment's total traffic this indexer served. Requires the
-            -- gateway-wide per-deployment totals, so no probe-based feed can ever compute it.
-            CASE WHEN q.query_count > 0
-                 THEN (a.query_count / q.query_count)::double precision
+            -- Share of the deployment's indexer attempts that went to this indexer. Bounded by
+            -- 1.0 by construction. No probe-based feed can compute this: it needs every indexer's
+            -- real traffic on that deployment.
+            CASE WHEN t.attempts > 0
+                 THEN (a.query_count / t.attempts)::double precision
                  ELSE NULL
-            END                                                   AS served_share
+            END                                                   AS served_share,
+            -- User queries on the deployment, from the gateway-level entity. Kept as its own field
+            -- rather than folded into a ratio: attempts ÷ user_queries is the gateway's RETRY rate,
+            -- a genuinely interesting number, but it is not a share and must not be labelled as one.
+            q.query_count::double precision                        AS deployment_user_queries
         FROM oracle_allocation_daily a
+        LEFT JOIN totals t
+               ON t.subgraph_deployment_ipfs_hash = a.subgraph_deployment_ipfs_hash
+              AND t.day_number = a.day_number
         LEFT JOIN oracle_query_daily q
                ON q.subgraph_deployment_ipfs_hash = a.subgraph_deployment_ipfs_hash
               AND q.day_number = a.day_number
@@ -1099,6 +1120,7 @@ pub async fn qos_canonical(
         "avg_query_fee": r.get::<Option<f64>, _>("avg_query_fee"),
         "total_query_fees": r.get::<Option<f64>, _>("total_query_fees"),
         "served_share": r.get::<Option<f64>, _>("served_share"),
+        "deployment_user_queries": r.get::<Option<f64>, _>("deployment_user_queries"),
     })).collect();
 
     // Publisher liveness, from the chain. Served alongside the data so a consumer can never read

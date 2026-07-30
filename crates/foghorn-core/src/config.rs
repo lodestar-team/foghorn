@@ -198,6 +198,10 @@ pub struct DataEdgeConfig {
     pub address: String,
     pub explorer_base: String,
     pub timeout_secs: u64,
+    /// Fetch each newly-seen payload from IPFS immediately, while it is still being provided.
+    pub capture_payloads: bool,
+    /// Tried in order, first success wins.
+    pub ipfs_gateways: Vec<String>,
 }
 
 impl Default for DataEdgeConfig {
@@ -208,6 +212,12 @@ impl Default for DataEdgeConfig {
             address: "0x5b4293b4c0f36cb5d4448950830bc777759b6c4f".to_string(),
             explorer_base: "https://gnosis.blockscout.com".to_string(),
             timeout_secs: 25,
+            capture_payloads: true,
+            ipfs_gateways: vec![
+                "https://ipfs.io/ipfs".to_string(),
+                "https://dweb.link/ipfs".to_string(),
+                "https://gateway.pinata.cloud/ipfs".to_string(),
+            ],
         }
     }
 }

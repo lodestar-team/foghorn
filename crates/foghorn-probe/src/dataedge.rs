@@ -10,12 +10,16 @@
 //! so decoding needs no ABI and no node. Blockscout's public API serves the transaction list
 //! without an API key, which keeps this path free of every dependency the oracle itself has.
 //!
-//! ## What this deliberately does not do
+//! ## Capturing payloads while they are still fetchable
 //!
-//! It does not fetch the pinned payloads. Those CIDs are not retrievable from public IPFS
-//! gateways (`ipfs.io` reports "no providers found"), so the metrics themselves still have to come
-//! from the oracle's subgraph. What this gives is the one thing the subgraph cannot: whether the
-//! publisher is alive, how far behind it is running, and whether a bucket was published whole.
+//! Historical CIDs are unreachable from public IPFS — eight gateways, four request forms, every one
+//! `504 no providers found for the CID`. Indexers must have fetched them when they were fresh, which
+//! means availability decays: a payload is retrievable near publication and stops being so later.
+//!
+//! So each newly-seen message gets one immediate fetch attempt. When it succeeds the raw bytes are
+//! ours, independent of anyone's subgraph continuing to exist. When it fails nothing is lost — the
+//! subgraph mirror still carries the parsed metrics. Attempts are made once per message, never
+//! retried in a later cycle, because a CID that was not served within minutes will not appear later.
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, TimeZone, Utc};
@@ -141,10 +145,65 @@ pub async fn poll_once(cfg: &DataEdgeConfig, pool: &PgPool) -> Result<u64> {
         .bind(lag as i32)
         .execute(pool)
         .await?;
-        stored += res.rows_affected();
+        let inserted = res.rows_affected();
+        stored += inserted;
+
+        // Only for messages we have not seen before. A CID that was not served within minutes of
+        // publication will not appear later, so retrying old ones on every cycle would be pure waste.
+        if inserted > 0 && cfg.capture_payloads {
+            capture_payload(&client, pool, &payload.hash, &payload.topic, bucket_ts, cfg).await;
+        }
     }
 
     Ok(stored)
+}
+
+
+/// One best-effort fetch of a pinned payload, stored verbatim on success.
+///
+/// Deliberately quiet about failure: a miss is the expected case for anything but a very fresh CID,
+/// and logging it as an error every five minutes would bury real problems. Recorded `via` so the
+/// decay of gateway availability is measurable rather than folklore.
+async fn capture_payload(
+    client: &reqwest::Client,
+    pool: &PgPool,
+    cid: &str,
+    topic: &str,
+    bucket_ts: DateTime<Utc>,
+    cfg: &DataEdgeConfig,
+) {
+    for base in cfg.ipfs_gateways.iter() {
+        let url = format!("{}/{}", base.trim_end_matches('/'), cid);
+        let Ok(resp) = client.get(&url).send().await else { continue };
+        if !resp.status().is_success() {
+            continue;
+        }
+        let Ok(body) = resp.text().await else { continue };
+        // A gateway error page is HTML, not a payload. Requiring valid JSON keeps junk out of a table
+        // whose entire value is being the publisher's own bytes.
+        if serde_json::from_str::<serde_json::Value>(&body).is_err() {
+            continue;
+        }
+        let bytes = body.len() as i32;
+        let res = sqlx::query(
+            r#"INSERT INTO oracle_payload (ipfs_hash, topic, bucket_ts, raw, bytes, via)
+               VALUES ($1, $2, $3, $4, $5, $6)
+               ON CONFLICT (ipfs_hash) DO NOTHING"#,
+        )
+        .bind(cid)
+        .bind(topic)
+        .bind(bucket_ts)
+        .bind(&body)
+        .bind(bytes)
+        .bind(base)
+        .execute(pool)
+        .await;
+        if res.is_ok() {
+            info!(cid, topic, bytes, via = %base, "Captured oracle payload from IPFS");
+        }
+        return;
+    }
+    debug!(cid, "Oracle payload not retrievable from any configured IPFS gateway");
 }
 
 /// Pull the JSON object out of ABI-encoded calldata.

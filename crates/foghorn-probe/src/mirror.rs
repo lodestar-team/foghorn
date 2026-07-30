@@ -134,14 +134,18 @@ pub async fn sync_once(
     macro_rules! sync {
         ($label:literal, $entity:literal, $fields:expr, $floor:expr, $upsert:ident, $field:ident) => {{
             let mut total = 0u64;
-            let mut last_id = String::new();
+            // Resume where the last cycle stopped. Without this the 5-minute entity re-read the same
+            // lowest-id slice every cycle and never advanced.
+            let mut last_id = load_cursor(pool, $entity).await;
             let mut failed: Option<anyhow::Error> = None;
+            let mut reached_end = false;
             for page in 0..cfg.max_pages.max(1) {
                 let items = match fetch_page(&client, &url, $entity, $fields, $floor, &last_id).await {
                     Ok(i) => i,
                     Err(e) => { failed = Some(e); break }
                 };
                 if items.is_empty() {
+                    reached_end = true;
                     break;
                 }
                 let full = items.len() == 1000;
@@ -155,6 +159,8 @@ pub async fn sync_once(
                     Err(e) => { failed = Some(e); break }
                 }
                 if !full || last_id.is_empty() {
+                    // A short page means this walk caught up with the end of the entity.
+                    reached_end = true;
                     break;
                 }
                 if page + 1 == cfg.max_pages.max(1) {
@@ -164,6 +170,11 @@ pub async fn sync_once(
                 }
             }
             counts.$field = total;
+            // Persist only on success: saving a cursor after a mid-walk failure would skip the rows
+            // the failed page never stored.
+            if failed.is_none() {
+                save_cursor(pool, $entity, &last_id, reached_end, total).await;
+            }
             match failed {
                 Some(e) => warn!(entity = $label, rows = total, error = %e,
                                  "Oracle mirror entity failed — others continue"),
@@ -188,6 +199,43 @@ pub async fn sync_once(
     sync!("allocation_point", "allocationDataPoints", ALLOCATION_POINT_FIELDS, point_floor, upsert_allocation_point, allocation_points);
 
     Ok(counts)
+}
+
+
+/// Read an entity's saved keyset position.
+///
+/// A `complete` cursor resets to the beginning: newly published rows can sort *below* the last id we
+/// saw, so a finished walk that kept its cursor would never notice them.
+async fn load_cursor(pool: &PgPool, entity: &str) -> String {
+    let row: Option<(String, bool)> =
+        sqlx::query_as("SELECT last_id, complete FROM mirror_cursor WHERE entity = $1")
+            .bind(entity)
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten();
+    match row {
+        Some((_, true)) | None => String::new(),
+        Some((last_id, false)) => last_id,
+    }
+}
+
+async fn save_cursor(pool: &PgPool, entity: &str, last_id: &str, complete: bool, rows: u64) {
+    let _ = sqlx::query(
+        r#"INSERT INTO mirror_cursor (entity, last_id, complete, last_rows, updated_at)
+           VALUES ($1, $2, $3, $4, NOW())
+           ON CONFLICT (entity) DO UPDATE SET
+               last_id = EXCLUDED.last_id,
+               complete = EXCLUDED.complete,
+               last_rows = EXCLUDED.last_rows,
+               updated_at = NOW()"#,
+    )
+    .bind(entity)
+    .bind(last_id)
+    .bind(complete)
+    .bind(rows as i64)
+    .execute(pool)
+    .await;
 }
 
 /// The newest `dayNumber` the oracle has published.

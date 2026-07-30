@@ -42,6 +42,13 @@ pub async fn run_alert_loop(webhook: String, pool: PgPool) {
 /// One poll cycle. Builds the full current failure roster, and posts it (in full)
 /// if it changed since the last post, or once a day as a liveness repost.
 async fn run_cycle(client: &reqwest::Client, webhook: &str, pool: &PgPool) -> Result<()> {
+    // Canonical-oracle staleness, posted independently of the indexer failure roster. On
+    // 2026-07-29 the oracle went 37 hours without publishing and the community found out by
+    // someone checking a block explorer by hand at hour 16. This is the part that closes that.
+    if let Err(e) = alert_oracle_stall(client, webhook, pool).await {
+        warn!(error = %e, "Oracle stall alert failed");
+    }
+
     let roster = current_failure_roster(pool).await?;
 
     // Advance the hysteresis machine and get the debounced fingerprint. Change
@@ -284,6 +291,89 @@ async fn debounced_fingerprint(pool: &PgPool, states: &[(String, String)]) -> Re
 fn build_message_body(header: &str, lines: &[String]) -> String {
     let footer = format!("For more details — {}/foghorn", DASHBOARD);
     format!("{header}\n{}\n{footer}", lines.join("\n"))
+}
+
+
+/// Post when the canonical QoS oracle's publisher stops publishing, and once when it recovers.
+///
+/// Thresholds reflect the publisher's real behaviour rather than a guess: it posts every 5 minutes
+/// with a steady ~30-minute lag, so 90 minutes of silence is unambiguous and well clear of routine
+/// jitter. State is a single row keyed `oracle_stall`, so a continuing outage is not re-posted every
+/// cycle — the channel gets one alert on the way down, one on the way back up.
+async fn alert_oracle_stall(client: &reqwest::Client, webhook: &str, pool: &PgPool) -> Result<()> {
+    const STALL_SECS: i64 = 90 * 60;
+
+    let (posted, bucket, lag): (
+        Option<chrono::DateTime<chrono::Utc>>,
+        Option<chrono::DateTime<chrono::Utc>>,
+        Option<i32>,
+    ) = sqlx::query_as(
+        "SELECT max(posted_at),
+                (SELECT bucket_ts   FROM oracle_message ORDER BY posted_at DESC LIMIT 1),
+                (SELECT lag_seconds FROM oracle_message ORDER BY posted_at DESC LIMIT 1)
+         FROM oracle_message",
+    )
+    .fetch_one(pool)
+    .await?;
+
+    // No observations yet means the DataEdge poller has not run, not that the oracle is dead. Saying
+    // "stalled" here would be a false alarm on every fresh deployment.
+    let Some(posted) = posted else { return Ok(()) };
+
+    let age = (chrono::Utc::now() - posted).num_seconds();
+    let stalled = age >= STALL_SECS;
+    let was_stalled: bool = sqlx::query_scalar(
+        "SELECT COALESCE((SELECT value = 'stalled' FROM alerter_flag WHERE key = 'oracle_stall'), false)",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap_or(false);
+
+    if stalled == was_stalled {
+        return Ok(());
+    }
+
+    let hours = age as f64 / 3600.0;
+    let content = if stalled {
+        format!(
+            "**Canonical QoS oracle has stopped publishing**\n\
+             Last DataEdge post: `{}` ({:.1}h ago)\n\
+             Last bucket published: `{}`\n\
+             Publish lag at the time: `{}`\n\
+             Read from Gnosis directly, not from the subgraph — a stale subgraph answers exactly \
+             like a fresh one.\n\
+             Canonical history and Lodestar's own measurements remain queryable: \
+             <https://www.lodestar-dashboard.com/qos>",
+            posted.to_rfc3339(),
+            hours,
+            bucket.map(|b| b.to_rfc3339()).unwrap_or_else(|| "unknown".into()),
+            lag.map(|l| format!("{}m", l / 60)).unwrap_or_else(|| "unknown".into()),
+        )
+    } else {
+        format!(
+            "**Canonical QoS oracle is publishing again**\n\
+             Latest post: `{}` ({}m ago). Worth checking whether it backfilled the gap or resumed \
+             from tip — a resumed-from-tip publisher leaves a permanent hole that looks like \
+             complete data.",
+            posted.to_rfc3339(),
+            age / 60,
+        )
+    };
+
+    if !post_chunks(client, webhook, &content).await? {
+        // Webhook rejected: leave the state untouched so the alert retries rather than being lost.
+        return Ok(());
+    }
+
+    sqlx::query(
+        r#"INSERT INTO alerter_flag (key, value, updated_at) VALUES ('oracle_stall', $1, NOW())
+           ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()"#,
+    )
+    .bind(if stalled { "stalled" } else { "live" })
+    .execute(pool)
+    .await?;
+
+    Ok(())
 }
 
 /// Post `content`, splitting on newlines into messages under Discord's char cap.
