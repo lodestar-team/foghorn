@@ -93,7 +93,13 @@ async fn main() -> anyhow::Result<()> {
     // Discord alerting — push new critical needs-attention items to #foghorn-alerts.
     if let Some(webhook) = config.alert_webhook.clone().filter(|w| !w.is_empty()) {
         let pool = pool.clone();
-        tokio::spawn(async move { alerter::run_alert_loop(webhook, pool).await });
+        // Cloned per task: each loop owns its own handles rather than sharing one across
+        // spawns, which the borrow checker will not allow anyway.
+        let roster_hook = webhook.clone();
+        let roster_pool = pool.clone();
+        tokio::spawn(async move { alerter::run_alert_loop(roster_hook, roster_pool).await });
+        // Separate loop: oracle liveness needs minutes, the roster digest needs hours.
+        tokio::spawn(async move { alerter::run_oracle_watch_loop(webhook, pool).await });
     } else {
         info!("No alert_webhook configured — Discord alerting disabled");
     }

@@ -22,6 +22,33 @@ const DASHBOARD: &str = "https://lodestar-dashboard.com";
 const ALERT_FILTER: &str = "(severity = 'critical' OR kind IN \
     ('behind-deployment','behind-deployments','serving-errors-deployment','behind-chainhead'))";
 
+/// How often the canonical-oracle stall check runs.
+///
+/// Deliberately far shorter than `POLL_SECS`. The failure-roster digest is hourly on purpose — it
+/// is a summary and re-posting it often would train people to mute the channel. Oracle liveness is
+/// the opposite: on 2026-07-29 the community discovered a stall by hand at hour 16, and an hourly
+/// check would have added up to another hour on top of the detection threshold. Publishing every 5
+/// minutes means a 5-minute check is proportionate.
+const ORACLE_POLL_SECS: u64 = 300;
+
+/// Watch the canonical oracle's publisher, independently of the roster digest's cadence.
+pub async fn run_oracle_watch_loop(webhook: String, pool: PgPool) {
+    info!(interval = ORACLE_POLL_SECS, "Oracle stall watch starting");
+    let client = match reqwest::Client::builder().timeout(Duration::from_secs(15)).build() {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(error = %e, "Failed to build oracle watch client — oracle alerting disabled");
+            return;
+        }
+    };
+    loop {
+        if let Err(e) = alert_oracle_stall(&client, &webhook, &pool).await {
+            warn!(error = %e, "Oracle stall alert failed");
+        }
+        tokio::time::sleep(Duration::from_secs(ORACLE_POLL_SECS)).await;
+    }
+}
+
 pub async fn run_alert_loop(webhook: String, pool: PgPool) {
     info!("Discord alert loop starting");
     let client = match reqwest::Client::builder().timeout(Duration::from_secs(15)).build() {
@@ -42,13 +69,6 @@ pub async fn run_alert_loop(webhook: String, pool: PgPool) {
 /// One poll cycle. Builds the full current failure roster, and posts it (in full)
 /// if it changed since the last post, or once a day as a liveness repost.
 async fn run_cycle(client: &reqwest::Client, webhook: &str, pool: &PgPool) -> Result<()> {
-    // Canonical-oracle staleness, posted independently of the indexer failure roster. On
-    // 2026-07-29 the oracle went 37 hours without publishing and the community found out by
-    // someone checking a block explorer by hand at hour 16. This is the part that closes that.
-    if let Err(e) = alert_oracle_stall(client, webhook, pool).await {
-        warn!(error = %e, "Oracle stall alert failed");
-    }
-
     let roster = current_failure_roster(pool).await?;
 
     // Advance the hysteresis machine and get the debounced fingerprint. Change
