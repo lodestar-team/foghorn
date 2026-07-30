@@ -941,7 +941,28 @@ pub async fn graphql_playground() -> axum::response::Html<String> {
 /// had no way to tell because a stale subgraph answers exactly like a fresh one. Serving each
 /// source's age next to its data makes "is this current?" answerable without trusting anybody.
 pub async fn qos_status(State(state): State<AppState>) -> Result<Json<Value>, StatusCode> {
-    let oracle: Option<chrono::DateTime<chrono::Utc>> =
+    // The oracle's age is when its PUBLISHER last posted to the DataEdge on Gnosis — NOT
+    // `max(allocation_qos.updated_at)`, which this endpoint originally used and which records
+    // when Foghorn ingested. That version reported the oracle as 187 seconds old while it had
+    // been dead for 37 hours, reproducing exactly the failure this page exists to expose. Our own
+    // ingest clock cannot distinguish a fresh feed from a stale one; only the chain can.
+    let (oracle_posted, oracle_bucket, oracle_lag): (
+        Option<chrono::DateTime<chrono::Utc>>,
+        Option<chrono::DateTime<chrono::Utc>>,
+        Option<i32>,
+    ) = sqlx::query_as(
+        "SELECT max(posted_at),
+                (SELECT bucket_ts   FROM oracle_message ORDER BY posted_at DESC LIMIT 1),
+                (SELECT lag_seconds FROM oracle_message ORDER BY posted_at DESC LIMIT 1)
+         FROM oracle_message",
+    )
+    .fetch_one(&state.pool)
+    .await
+    .unwrap_or((None, None, None));
+
+    // Kept separately and clearly labelled: useful for spotting a broken ingest, useless for
+    // judging the oracle.
+    let ingested_at: Option<chrono::DateTime<chrono::Utc>> =
         sqlx::query_scalar("SELECT max(updated_at) FROM allocation_qos")
             .fetch_one(&state.pool)
             .await
@@ -965,9 +986,17 @@ pub async fn qos_status(State(state): State<AppState>) -> Result<Json<Value>, St
         "sources": [
             {
                 "source": "edgeandnode-qos-oracle",
-                "last_update": oracle.map(|t| t.to_rfc3339()),
-                "age_seconds": age(oracle),
-                "note": "ingested from the oracle subgraph; ages when their publisher stalls",
+                "last_update": oracle_posted.map(|t| t.to_rfc3339()),
+                "age_seconds": age(oracle_posted),
+                "measured_from": "DataEdge transactions on Gnosis — the publisher itself",
+                // The bucket the last post described, and how far behind it was running. Lag is
+                // the leading indicator: it went 30.3 → 47.7 minutes about 17 minutes before the
+                // 2026-07-29 outage, while liveness still looked fine.
+                "last_bucket_published": oracle_bucket.map(|t| t.to_rfc3339()),
+                "publish_lag_seconds": oracle_lag,
+                // Explicitly NOT the oracle's age. Ours.
+                "foghorn_last_ingested_at": ingested_at.map(|t| t.to_rfc3339()),
+                "note": "read from the chain it publishes to, so a stalled publisher cannot look fresh",
             },
             {
                 "source": "foghorn",

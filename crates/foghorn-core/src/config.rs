@@ -184,6 +184,34 @@ impl Default for QosRollupConfig {
     }
 }
 
+/// Polling the canonical oracle's DataEdge on Gnosis for PUBLISHER liveness.
+///
+/// Exists because every other view Foghorn has of that oracle arrives through its subgraph, which
+/// makes freshness a measure of our own ingest clock rather than of whether it published. Defaults
+/// point at the live QoS DataEdge and Gnosis Blockscout, which needs no API key.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct DataEdgeConfig {
+    pub enabled: bool,
+    /// The publisher posts every 5 minutes; polling faster only burns explorer quota.
+    pub interval_secs: u64,
+    pub address: String,
+    pub explorer_base: String,
+    pub timeout_secs: u64,
+}
+
+impl Default for DataEdgeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval_secs: 120,
+            address: "0x5b4293b4c0f36cb5d4448950830bc777759b6c4f".to_string(),
+            explorer_base: "https://gnosis.blockscout.com".to_string(),
+            timeout_secs: 25,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Clone)]
 #[serde(default)]
 pub struct FoghornConfig {
@@ -207,6 +235,7 @@ pub struct FoghornConfig {
     pub scoring: ScoringConfig,
     pub status_probe: StatusProbeConfig,
     pub qos_rollup: QosRollupConfig,
+    pub data_edge: DataEdgeConfig,
     /// Discord webhook URL for #foghorn-alerts. When set, new critical
     /// needs-attention items are pushed to Discord. Empty = alerting disabled.
     pub alert_webhook: Option<String>,
@@ -241,6 +270,7 @@ impl Default for FoghornConfig {
             scoring: ScoringConfig::default(),
             status_probe: StatusProbeConfig::default(),
             qos_rollup: QosRollupConfig::default(),
+            data_edge: DataEdgeConfig::default(),
             alert_webhook: None,
         }
     }

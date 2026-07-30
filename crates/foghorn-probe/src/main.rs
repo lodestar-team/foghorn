@@ -7,6 +7,7 @@ use tracing::info;
 mod alerter;
 mod autodiscover;
 mod cluster;
+mod dataedge;
 mod discovery;
 mod executor;
 mod ingest;
@@ -50,6 +51,14 @@ async fn main() -> anyhow::Result<()> {
         let status_cfg = config.status_probe.clone();
         let pool = pool.clone();
         tokio::spawn(async move { status::run_status_loop(status_cfg, pool).await });
+    }
+
+    // Canonical oracle publisher liveness, straight from Gnosis. No API key, no subgraph, so
+    // this keeps working precisely when the oracle's own pipeline does not.
+    {
+        let de_cfg = config.data_edge.clone();
+        let pool = pool.clone();
+        tokio::spawn(async move { dataedge::run_dataedge_loop(de_cfg, pool).await });
     }
 
     // QoS rollup — Foghorn's OWN observations into the oracle's schema, so the QoS surface
