@@ -836,7 +836,44 @@ pub async fn deployment_qos(
         "query_count": r.get::<Option<i64>, _>("query_count"),
     })).collect();
 
-    Ok(Json(json!({ "deployment_id": deployment_id, "indexers": indexers })))
+    // Foghorn's own measurements alongside the oracle's. A failure to read them must not take
+    // the oracle view down with it — the entire point of this feed is that one source being
+    // unavailable does not blank the page.
+    let measured = measured_block(
+        &state.pool,
+        crate::qos::DailyFilter::for_deployment(&deployment_id),
+    )
+    .await;
+
+    Ok(Json(json!({
+        "deployment_id": deployment_id,
+        // Legacy key, oracle-fed, unchanged for existing dashboard consumers.
+        "indexers": indexers,
+        "oracle": { "source": "edgeandnode-qos-oracle", "indexers": indexers },
+        "measured": measured,
+    })))
+}
+
+/// The `measured` half of a QoS response: Foghorn's own daily rollup plus its provenance.
+///
+/// Returns an `error` block rather than propagating, so a fault in the new feed can never take
+/// down a response that would otherwise have served the oracle view perfectly well.
+async fn measured_block(pool: &sqlx::PgPool, filter: crate::qos::DailyFilter) -> Value {
+    match crate::qos::daily_points(pool, &filter).await {
+        Ok(rows) => {
+            let gateway_id = rows
+                .first()
+                .and_then(|r| r.get::<Option<String>, _>("gateway_id"));
+            let points: Vec<Value> = rows.iter().map(crate::qos::row_to_oracle_json).collect();
+            let mut block = crate::qos::measured_provenance(gateway_id.as_deref());
+            block["allocationDailyDataPoints"] = json!(points);
+            block
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "measured QoS rollup query failed");
+            json!({ "source": "foghorn", "error": "unavailable" })
+        }
+    }
 }
 
 /// Per-deployment query success/lag for one INDEXER (all its allocations) —
@@ -862,7 +899,337 @@ pub async fn indexer_allocations_qos(
         "query_count": r.get::<Option<i64>, _>("query_count"),
     })).collect();
 
-    Ok(Json(json!({ "indexer_address": address.to_lowercase(), "deployments": deployments })))
+    let measured = measured_block(
+        &state.pool,
+        crate::qos::DailyFilter::for_indexer(&address),
+    )
+    .await;
+
+    Ok(Json(json!({
+        "indexer_address": address.to_lowercase(),
+        // Legacy key, oracle-fed, unchanged for existing dashboard consumers.
+        "deployments": deployments,
+        "oracle": { "source": "edgeandnode-qos-oracle", "deployments": deployments },
+        "measured": measured,
+    })))
+}
+
+/// Execute an oracle-compatible GraphQL query.
+///
+/// Deliberately not using `async-graphql-axum`: that crate's current release requires axum 0.8,
+/// and upgrading would rewrite every `:param` route in this file for a wrapper that is two lines
+/// of glue. `async_graphql::Request`/`Response` are already Deserialize/Serialize, which is the
+/// entire integration.
+pub async fn graphql_handler(
+    State(state): State<AppState>,
+    Json(req): Json<async_graphql::Request>,
+) -> Json<async_graphql::Response> {
+    Json(state.schema.execute(req).await)
+}
+
+/// GraphQL playground, so a consumer can paste its existing oracle query and see it answered.
+pub async fn graphql_playground() -> axum::response::Html<String> {
+    axum::response::Html(async_graphql::http::playground_source(
+        async_graphql::http::GraphQLPlaygroundConfig::new("/v1/qos/graphql"),
+    ))
+}
+
+/// Side-by-side freshness of both QoS sources — the headline panel.
+///
+/// This is the whole argument in one response: how old is each feed. On 2026-07-29 the oracle
+/// went 35 hours without publishing while Foghorn kept measuring every minute, and a consumer
+/// had no way to tell because a stale subgraph answers exactly like a fresh one. Serving each
+/// source's age next to its data makes "is this current?" answerable without trusting anybody.
+pub async fn qos_status(State(state): State<AppState>) -> Result<Json<Value>, StatusCode> {
+    let oracle: Option<chrono::DateTime<chrono::Utc>> =
+        sqlx::query_scalar("SELECT max(updated_at) FROM allocation_qos")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap_or(None);
+
+    let (bucket, computed): (
+        Option<chrono::DateTime<chrono::Utc>>,
+        Option<chrono::DateTime<chrono::Utc>>,
+    ) = sqlx::query_as("SELECT max(bucket_start), max(computed_at) FROM foghorn_qos")
+        .fetch_one(&state.pool)
+        .await
+        .unwrap_or((None, None));
+
+    let now = chrono::Utc::now();
+    let age = |t: Option<chrono::DateTime<chrono::Utc>>| {
+        t.map(|t| (now - t).num_seconds()).map(Value::from).unwrap_or(Value::Null)
+    };
+
+    Ok(Json(json!({
+        "checked_at": now.to_rfc3339(),
+        "sources": [
+            {
+                "source": "edgeandnode-qos-oracle",
+                "last_update": oracle.map(|t| t.to_rfc3339()),
+                "age_seconds": age(oracle),
+                "note": "ingested from the oracle subgraph; ages when their publisher stalls",
+            },
+            {
+                "source": "foghorn",
+                "gateway_id": "lodestar",
+                "last_bucket": bucket.map(|t| t.to_rfc3339()),
+                "last_computed": computed.map(|t| t.to_rfc3339()),
+                "age_seconds": age(bucket),
+                "note": "measured locally; no external publisher in the path",
+            },
+        ],
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct QosBucketParams {
+    pub indexer: Option<String>,
+    pub deployment: Option<String>,
+    pub hours: Option<i32>,
+    pub limit: Option<i64>,
+}
+
+/// Agreement between Foghorn's measurements and the canonical oracle.
+///
+/// This is the honesty check: if the two feeds disagree wildly, ours needs explaining before
+/// anyone should rely on it. It is also the only place a *third* fact shows up — an indexer
+/// returning fast, well-formed garbage scores a perfect 200-rate in the oracle and fails
+/// Foghorn's correctness clustering. Those rows are the interesting output, not noise.
+///
+/// ## What is deliberately NOT compared
+///
+/// `query_count`. The oracle counts organic queries a gateway routed; Foghorn counts probes it
+/// chose to send. A difference there is a category error, not a disagreement, so reporting a
+/// delta on it would manufacture alarm out of nothing.
+///
+/// ## Why disagreement is not automatically our error
+///
+/// The two have different vantage points. The oracle sees real user traffic through one gateway;
+/// Foghorn sees synthetic block-pinned probes from one location. Different query mixes, different
+/// geography, wildly different sample sizes. `allocation_qos` also holds a trailing multi-day
+/// window rather than per-day rows, so the comparison window is matched to it rather than to a
+/// day boundary.
+pub async fn qos_compare(
+    State(state): State<AppState>,
+    Query(params): Query<QosCompareParams>,
+) -> Result<Json<Value>, StatusCode> {
+    // Default matches ingest.rs's ALLOC_WINDOW_DAYS, so like is compared with like.
+    let days: i32 = params.days.unwrap_or(3).clamp(1, 30);
+    // A pair below this many probes is reported but excluded from the aggregate error, because a
+    // success rate over three probes is not evidence of anything.
+    let min_probes: i64 = params.min_probes.unwrap_or(20).max(1);
+
+    let rows = sqlx::query(
+        r#"
+        WITH mine AS (
+            SELECT
+                indexer_address,
+                deployment_id,
+                sum(query_count)::bigint               AS probes,
+                sum(num_indexer_200_responses)::double precision
+                    / NULLIF(sum(query_count), 0)::double precision AS success_rate,
+                avg(avg_indexer_blocks_behind)         AS blocks_behind,
+                sum(comparable_count)::bigint          AS comparable,
+                sum(divergent_count)::bigint           AS divergent
+            FROM foghorn_qos
+            WHERE bucket_start >= NOW() - make_interval(days => $1)
+            GROUP BY 1, 2
+        )
+        SELECT
+            m.indexer_address,
+            m.deployment_id,
+            m.probes,
+            m.success_rate                AS mine_success_rate,
+            m.blocks_behind               AS mine_blocks_behind,
+            CASE WHEN m.comparable > 0
+                 THEN 1.0 - (m.divergent::double precision / m.comparable::double precision)
+                 ELSE NULL
+            END                           AS mine_correctness_rate,
+            o.success_rate                AS oracle_success_rate,
+            o.blocks_behind               AS oracle_blocks_behind,
+            o.query_count                 AS oracle_query_count
+        FROM mine m
+        -- INNER JOIN on purpose: a pair only one side has says nothing about agreement. Coverage
+        -- gaps are a separate question, answered by the counts below rather than by null deltas.
+        JOIN allocation_qos o
+          ON o.indexer_address = m.indexer_address
+         AND o.deployment_id   = m.deployment_id
+        ORDER BY abs(COALESCE(m.success_rate, 0) - COALESCE(o.success_rate, 0)) DESC
+        LIMIT 2000
+        "#,
+    )
+    .bind(days)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let mut pairs: Vec<Value> = Vec::with_capacity(rows.len());
+    let mut abs_err_sum = 0.0f64;
+    let mut abs_err_n = 0u64;
+    let mut disagree_10 = 0u64;
+    // Indexers the oracle scores well but Foghorn caught serving wrong data. The reason this
+    // whole comparison is worth publishing.
+    let mut oracle_blind = 0u64;
+
+    for r in &rows {
+        let probes: i64 = r.get("probes");
+        let mine_sr: Option<f64> = r.get("mine_success_rate");
+        let oracle_sr: Option<f64> = r.get("oracle_success_rate");
+        let mine_correctness: Option<f64> = r.get("mine_correctness_rate");
+
+        let delta = match (mine_sr, oracle_sr) {
+            (Some(a), Some(b)) => Some(a - b),
+            _ => None,
+        };
+
+        let counted = probes >= min_probes && delta.is_some();
+        if let (true, Some(d)) = (counted, delta) {
+            abs_err_sum += d.abs();
+            abs_err_n += 1;
+            if d.abs() >= 0.10 {
+                disagree_10 += 1;
+            }
+        }
+
+        // "The oracle is happy and we are not": high 200-rate over there, wrong data over here.
+        let blind = oracle_sr.unwrap_or(0.0) >= 0.99 && mine_correctness.is_some_and(|c| c < 1.0);
+        if blind {
+            oracle_blind += 1;
+        }
+
+        pairs.push(json!({
+            "indexer_address": r.get::<String, _>("indexer_address"),
+            "deployment_id": r.get::<String, _>("deployment_id"),
+            "probes": probes,
+            "counted_in_aggregate": counted,
+            "foghorn": {
+                "success_rate": mine_sr,
+                "blocks_behind": r.get::<Option<f64>, _>("mine_blocks_behind"),
+                "correctness_rate": mine_correctness,
+            },
+            "oracle": {
+                "success_rate": oracle_sr,
+                "blocks_behind": r.get::<Option<f64>, _>("oracle_blocks_behind"),
+                // Present for context only. Not comparable with our probe count.
+                "query_count": r.get::<Option<i64>, _>("oracle_query_count"),
+            },
+            "success_rate_delta": delta,
+            "oracle_blind_spot": blind,
+        }));
+    }
+
+    let overlap = rows.len() as u64;
+    let mine_total: i64 = sqlx::query_scalar(
+        "SELECT count(DISTINCT (indexer_address, deployment_id)) FROM foghorn_qos
+         WHERE bucket_start >= NOW() - make_interval(days => $1)",
+    )
+    .bind(days)
+    .fetch_one(&state.pool)
+    .await
+    .unwrap_or(0);
+    let oracle_total: i64 = sqlx::query_scalar("SELECT count(*) FROM allocation_qos")
+        .fetch_one(&state.pool)
+        .await
+        .unwrap_or(0);
+
+    Ok(Json(json!({
+        "window_days": days,
+        "min_probes_for_aggregate": min_probes,
+        "coverage": {
+            "overlapping_pairs": overlap,
+            "foghorn_pairs": mine_total,
+            "oracle_pairs": oracle_total,
+            "note": "Coverage differs because the oracle sees whatever its gateway routed while \
+                     Foghorn sees whatever it probed. Neither is a subset of the other.",
+        },
+        "agreement": {
+            "pairs_in_aggregate": abs_err_n,
+            "mean_absolute_success_rate_error": if abs_err_n > 0 {
+                Some(abs_err_sum / abs_err_n as f64)
+            } else { None },
+            "pairs_disagreeing_over_10pct": disagree_10,
+            "oracle_blind_spots": oracle_blind,
+            "oracle_blind_spot_means": "oracle success rate >= 99% while Foghorn measured \
+                                        incorrect data — served fast, well-formed, and wrong",
+        },
+        "not_compared": {
+            "query_count": "probes dispatched vs organic queries routed — a category error, not a \
+                            disagreement",
+        },
+        "pairs": pairs,
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct QosCompareParams {
+    pub days: Option<i32>,
+    pub min_probes: Option<i64>,
+}
+
+/// Bucket-resolution measured QoS — the only place latency percentiles are served.
+///
+/// Percentiles do not recombine, so the daily rollup deliberately omits them (see
+/// `crate::qos`). Here they are as computed, at the resolution they were computed at.
+pub async fn qos_buckets(
+    State(state): State<AppState>,
+    Query(params): Query<QosBucketParams>,
+) -> Result<Json<Value>, StatusCode> {
+    let indexer = params.indexer.map(|s| s.to_lowercase());
+    let deployment = params.deployment;
+    // Clamped rather than rejected: a caller asking for a decade of buckets gets a month, not a
+    // 400. The row cap is what actually protects the database.
+    let hours: i32 = params.hours.unwrap_or(24).clamp(1, 720);
+    let limit: i64 = params.limit.unwrap_or(500).clamp(1, 5000);
+
+    let rows = sqlx::query(
+        r#"SELECT indexer_address, deployment_id, bucket_start, bucket_secs, gateway_id, chain_id,
+                  query_count, num_indexer_200_responses, proportion_indexer_200_responses,
+                  avg_indexer_latency_ms, max_indexer_latency_ms, stdev_indexer_latency_ms,
+                  latency_p50_ms, latency_p95_ms, latency_p99_ms,
+                  avg_indexer_blocks_behind, max_indexer_blocks_behind,
+                  comparable_count, divergent_count, correctness_rate
+           FROM foghorn_qos
+           WHERE ($1::text IS NULL OR indexer_address = $1)
+             AND ($2::text IS NULL OR deployment_id   = $2)
+             AND bucket_start >= NOW() - make_interval(hours => $3)
+           ORDER BY bucket_start DESC
+           LIMIT $4"#,
+    )
+    .bind(&indexer)
+    .bind(&deployment)
+    .bind(hours)
+    .bind(limit)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let buckets: Vec<Value> = rows.iter().map(|r| json!({
+        "indexer_wallet": r.get::<String, _>("indexer_address"),
+        "subgraph_deployment_ipfs_hash": r.get::<String, _>("deployment_id"),
+        "bucket_start": r.get::<chrono::DateTime<chrono::Utc>, _>("bucket_start").to_rfc3339(),
+        "bucket_secs": r.get::<i32, _>("bucket_secs"),
+        "gateway_id": r.get::<Option<String>, _>("gateway_id"),
+        "chain_id": r.get::<Option<String>, _>("chain_id"),
+        "query_count": r.get::<i64, _>("query_count"),
+        "num_indexer_200_responses": r.get::<i64, _>("num_indexer_200_responses"),
+        "proportion_indexer_200_responses": r.get::<f64, _>("proportion_indexer_200_responses"),
+        "avg_indexer_latency_ms": r.get::<Option<f64>, _>("avg_indexer_latency_ms"),
+        "max_indexer_latency_ms": r.get::<Option<f64>, _>("max_indexer_latency_ms"),
+        "stdev_indexer_latency_ms": r.get::<Option<f64>, _>("stdev_indexer_latency_ms"),
+        "latency_p50_ms": r.get::<Option<i32>, _>("latency_p50_ms"),
+        "latency_p95_ms": r.get::<Option<i32>, _>("latency_p95_ms"),
+        "latency_p99_ms": r.get::<Option<i32>, _>("latency_p99_ms"),
+        "avg_indexer_blocks_behind": r.get::<Option<f64>, _>("avg_indexer_blocks_behind"),
+        "max_indexer_blocks_behind": r.get::<Option<f64>, _>("max_indexer_blocks_behind"),
+        "comparable_count": r.get::<i64, _>("comparable_count"),
+        "divergent_count": r.get::<i64, _>("divergent_count"),
+        "correctness_rate": r.get::<Option<f64>, _>("correctness_rate"),
+    })).collect();
+
+    let mut out = crate::qos::measured_provenance(None);
+    out["window_hours"] = json!(hours);
+    out["buckets"] = json!(buckets);
+    Ok(Json(out))
 }
 
 /// Deployments flagged as non-deterministic (diverge every round — subgraph's fault).

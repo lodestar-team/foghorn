@@ -146,6 +146,44 @@ impl Default for StatusProbeConfig {
     }
 }
 
+/// Rolling Foghorn's own observations into QoS, in the oracle's schema.
+///
+/// `bucket_secs` defaults to the oracle's 5-minute cadence so the two feeds are directly
+/// comparable. `interval_secs` is deliberately far shorter than E&N's ~30-minute watermark:
+/// their delay exists because organic gateway traffic arrives late over Kafka, whereas a probe
+/// result is complete the moment the probe returns. There is nothing to wait for.
+///
+/// `lookback_secs` recomputes a trailing window rather than only the current bucket, so a
+/// late-landing observation or a restart mid-bucket converges instead of leaving a permanent
+/// hole. That is the specific failure we watched E&N's pipeline produce on 2026-07-29.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct QosRollupConfig {
+    pub enabled: bool,
+    pub interval_secs: u64,
+    pub bucket_secs: u64,
+    pub lookback_secs: u64,
+    /// Stamped onto every row as the oracle's `gateway_id`. The reference schema puts this on
+    /// every data point, so publishing as a distinct gateway is the format's own design, not a
+    /// fork of it. Never leave this as another party's id.
+    pub gateway_id: String,
+    /// Stamped onto every row as the oracle's `chain_id`.
+    pub chain_id: String,
+}
+
+impl Default for QosRollupConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval_secs: 60,
+            bucket_secs: 300,
+            lookback_secs: 3600,
+            gateway_id: "lodestar".to_string(),
+            chain_id: "arbitrum-one".to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Clone)]
 #[serde(default)]
 pub struct FoghornConfig {
@@ -168,6 +206,7 @@ pub struct FoghornConfig {
     pub lodestar: Option<LodestarConfig>,
     pub scoring: ScoringConfig,
     pub status_probe: StatusProbeConfig,
+    pub qos_rollup: QosRollupConfig,
     /// Discord webhook URL for #foghorn-alerts. When set, new critical
     /// needs-attention items are pushed to Discord. Empty = alerting disabled.
     pub alert_webhook: Option<String>,
@@ -201,6 +240,7 @@ impl Default for FoghornConfig {
             lodestar: None,
             scoring: ScoringConfig::default(),
             status_probe: StatusProbeConfig::default(),
+            qos_rollup: QosRollupConfig::default(),
             alert_webhook: None,
         }
     }

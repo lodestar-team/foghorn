@@ -11,6 +11,7 @@ mod discovery;
 mod executor;
 mod ingest;
 mod lodestar;
+mod qos;
 mod resolver;
 mod scheduler;
 mod scorer;
@@ -49,6 +50,15 @@ async fn main() -> anyhow::Result<()> {
         let status_cfg = config.status_probe.clone();
         let pool = pool.clone();
         tokio::spawn(async move { status::run_status_loop(status_cfg, pool).await });
+    }
+
+    // QoS rollup — Foghorn's OWN observations into the oracle's schema, so the QoS surface
+    // survives Edge & Node's pipeline being down. Pure SQL over stored observations: no extra
+    // network traffic, no new dependency, nothing to stall.
+    {
+        let qos_cfg = config.qos_rollup.clone();
+        let pool = pool.clone();
+        tokio::spawn(async move { qos::run_qos_rollup_loop(qos_cfg, pool).await });
     }
 
     // Scoring loop — grades, verdicts, attention, sybil clusters.
