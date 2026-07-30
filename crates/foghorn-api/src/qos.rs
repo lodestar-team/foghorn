@@ -266,5 +266,20 @@ pub fn measured_provenance(gateway_id: Option<&str>) -> Value {
         "method": "active block-pinned probing, JCS-canonicalised response clustering",
         "query_count_means": "probes dispatched by Foghorn, NOT organic gateway traffic",
         "independent_of": "Edge & Node QoS oracle pipeline",
+        // Stated in-band because it is the one caveat that changes how a number should be read,
+        // and because the oracle comparison exposes it plainly: across 20 overlapping allocations
+        // our success rate was higher than theirs every single time, never lower. That is not them
+        // being wrong — probes are dispatched through E&N's gateway, which routes to indexers it
+        // believes are healthy, so failures it already avoids are invisible to us.
+        //
+        // Removing the bias needs direct-to-indexer dispatch, which needs TAP receipts: every
+        // indexer tested returns `402 No Tap receipt was found in the request`, so unpaid direct
+        // probing is not possible. Until then this field is a ceiling, not a measurement.
+        "success_rate_bias": "OPTIMISTIC — probes are routed by E&N's gateway, so indexers it \
+                              declines to route to are never observed failing. Treat \
+                              proportion_indexer_200_responses as an upper bound.",
+        "unbiased_fields": "avg/max_indexer_blocks_behind (chainhead resolved independently) and \
+                            correctness_rate (responses compared against each other, not reported \
+                            by the indexer)",
     })
 }

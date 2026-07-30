@@ -12,6 +12,7 @@ mod discovery;
 mod executor;
 mod ingest;
 mod lodestar;
+mod mirror;
 mod qos;
 mod resolver;
 mod scheduler;
@@ -51,6 +52,17 @@ async fn main() -> anyhow::Result<()> {
         let status_cfg = config.status_probe.clone();
         let pool = pool.clone();
         tokio::spawn(async move { status::run_status_loop(status_cfg, pool).await });
+    }
+
+    // Full mirror of the canonical oracle. This is the clone: every number it ever published,
+    // held by Lodestar, served in its own schema, queryable without an API key. It cannot invent
+    // data for a window the publisher never produced — but the history stays served and the freeze
+    // stays visible.
+    {
+        let mirror_cfg = config.oracle_mirror.clone();
+        let api_key = config.gateway.as_ref().map(|g| g.api_key.clone());
+        let pool = pool.clone();
+        tokio::spawn(async move { mirror::run_mirror_loop(mirror_cfg, api_key, pool).await });
     }
 
     // Canonical oracle publisher liveness, straight from Gnosis. No API key, no subgraph, so
