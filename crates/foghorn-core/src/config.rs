@@ -228,9 +228,10 @@ pub struct OracleMirrorConfig {
     /// Trailing days of daily entities to re-pull each cycle. The newest days are still being
     /// written, so a one-shot sync would freeze partial values forever.
     pub window_days: u32,
-    /// Separate, shorter window for the 5-minute `AllocationDataPoint` entity — by far the highest
-    /// row count, so it gets its own budget rather than consuming the whole request allowance.
-    pub point_window_days: u32,
+    /// Window for the 5-minute `AllocationDataPoint` entity, in HOURS. One row per indexer ×
+    /// deployment × 288 buckets a day means a day-granular window is millions of rows, far past any
+    /// page budget, so this is deliberately the smallest unit that makes sense.
+    pub point_window_hours: u32,
     /// Keyset pages per entity per cycle. Hitting this cap is logged as INCOMPLETE rather than
     /// passing silently for complete.
     pub max_pages: u32,
@@ -246,7 +247,7 @@ impl Default for OracleMirrorConfig {
             subgraph_id: "Dtr9rETvwokot4BSXaD5tECanXfqfJKcvHuaaEgPDD2D".to_string(),
             gateway_base: "https://gateway-arbitrum.network.thegraph.com/api".to_string(),
             window_days: 7,
-            point_window_days: 2,
+            point_window_hours: 24,
             max_pages: 40,
             timeout_secs: 30,
         }

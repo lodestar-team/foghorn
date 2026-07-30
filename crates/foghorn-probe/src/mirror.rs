@@ -44,8 +44,12 @@ const ALLOCATION_DAILY_FIELDS: &str = "id dayNumber dayStart dayEnd dataPointCou
 
 const INDEXER_DAILY_FIELDS: &str = ALLOCATION_DAILY_FIELDS;
 
+/// NOTE: `QueryDailyDataPoint` has NO `subgraph_deployment_ipfs_hash`, unlike every other entity
+/// here — it only carries the `subgraphDeployment` relation. Copying the sibling field list got the
+/// whole entity rejected with `Type QueryDailyDataPoint has no field
+/// subgraph_deployment_ipfs_hash`, so the deployment is read from the nested id instead.
 const QUERY_DAILY_FIELDS: &str = "id dayNumber dayStart dayEnd dataPointCount \
-    subgraph_deployment_ipfs_hash avg_gateway_latency_ms max_gateway_latency_ms avg_query_fee \
+    subgraphDeployment { id } avg_gateway_latency_ms max_gateway_latency_ms avg_query_fee \
     max_query_fee gateway_query_success_rate user_attributed_error_rate most_recent_query_ts \
     query_count total_query_fees start_epoch end_epoch chain_id gateway_id";
 
@@ -120,95 +124,128 @@ pub async fn sync_once(
 
     let mut counts = SyncCounts::default();
 
-    let rows = paginate(&client, &url, "allocationDailyDataPoints", ALLOCATION_DAILY_FIELDS, floor, cfg).await?;
-    counts.allocation_daily = upsert_allocation_daily(pool, &rows).await?;
+    // Each entity syncs independently. Previously one bad field name in `queryDailyDataPoints`
+    // aborted the whole cycle with `?`, which silently took `allocationDataPoints` down with it —
+    // two of four tables stayed empty because of a mistake in a third. A per-entity failure is
+    // logged and the rest still run.
+    // Expanded inline rather than as a generic helper: passing an `async fn(&PgPool, &[Value])` as
+    // a type parameter needs a higher-ranked bound Rust cannot infer here ("implementation of `Fn`
+    // is not general enough"). A macro sidesteps it and keeps each call concrete.
+    macro_rules! sync {
+        ($label:literal, $entity:literal, $fields:expr, $floor:expr, $upsert:ident, $field:ident) => {{
+            let mut total = 0u64;
+            let mut last_id = String::new();
+            let mut failed: Option<anyhow::Error> = None;
+            for page in 0..cfg.max_pages.max(1) {
+                let items = match fetch_page(&client, &url, $entity, $fields, $floor, &last_id).await {
+                    Ok(i) => i,
+                    Err(e) => { failed = Some(e); break }
+                };
+                if items.is_empty() {
+                    break;
+                }
+                let full = items.len() == 1000;
+                last_id = items
+                    .last()
+                    .and_then(|r| r["id"].as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                match $upsert(pool, &items).await {
+                    Ok(n) => total += n,
+                    Err(e) => { failed = Some(e); break }
+                }
+                if !full || last_id.is_empty() {
+                    break;
+                }
+                if page + 1 == cfg.max_pages.max(1) {
+                    // Never let a cap look like completeness.
+                    warn!(entity = $label, pages = cfg.max_pages, rows = total,
+                          "Oracle mirror hit its page cap — this entity is INCOMPLETE for this cycle");
+                }
+            }
+            counts.$field = total;
+            match failed {
+                Some(e) => warn!(entity = $label, rows = total, error = %e,
+                                 "Oracle mirror entity failed — others continue"),
+                None => info!(entity = $label, rows = total, "Oracle mirror entity synced"),
+            }
+        }};
+    }
 
-    let rows = paginate(&client, &url, "indexerDailyDataPoints", INDEXER_DAILY_FIELDS, floor, cfg).await?;
-    counts.indexer_daily = upsert_indexer_daily(pool, &rows).await?;
+    sync!("allocation_daily", "allocationDailyDataPoints", ALLOCATION_DAILY_FIELDS, floor, upsert_allocation_daily, allocation_daily);
+    sync!("indexer_daily", "indexerDailyDataPoints", INDEXER_DAILY_FIELDS, floor, upsert_indexer_daily, indexer_daily);
+    sync!("query_daily", "queryDailyDataPoints", QUERY_DAILY_FIELDS, floor, upsert_query_daily, query_daily);
 
-    let rows = paginate(&client, &url, "queryDailyDataPoints", QUERY_DAILY_FIELDS, floor, cfg).await?;
-    counts.query_daily = upsert_query_daily(pool, &rows).await?;
-
-    // Highest-volume entity by far (one row per indexer × deployment × 5 minutes), so it is synced
-    // over its own, shorter window. Pulling the full day window of these would be most of the
-    // request budget for the least-queried table.
-    let point_floor = latest.saturating_sub(cfg.point_window_days.max(1) as i64 - 1);
-    let rows = paginate(&client, &url, "allocationDataPoints", ALLOCATION_POINT_FIELDS, point_floor, cfg).await?;
-    counts.allocation_points = upsert_allocation_point(pool, &rows).await?;
+    // The 5-minute entity is one row per indexer × deployment × 288 buckets a day, so a
+    // day-granular window is millions of rows — orders of magnitude past any page budget. It gets a
+    // window measured in HOURS, converted to the oracle's day floor for the filter and then bounded
+    // by the page cap, which is logged when hit rather than passing for completeness.
+    let point_floor = if cfg.point_window_hours >= 24 {
+        latest.saturating_sub((cfg.point_window_hours / 24) as i64)
+    } else {
+        latest
+    };
+    sync!("allocation_point", "allocationDataPoints", ALLOCATION_POINT_FIELDS, point_floor, upsert_allocation_point, allocation_points);
 
     Ok(counts)
 }
 
 /// The newest `dayNumber` the oracle has published.
+///
+/// The sync window is anchored to this rather than to our own clock: the oracle's `dayNumber` uses
+/// its own epoch, so deriving a floor from wall-time would silently sync nothing whenever the two
+/// calendars disagreed.
 async fn latest_day(client: &reqwest::Client, url: &str) -> Result<i64> {
     let q = json!({
         "query": "{ allocationDailyDataPoints(first: 1, orderBy: dayNumber, orderDirection: desc) { dayNumber } }"
     });
     let v: Value = client.post(url).json(&q).send().await?.json().await?;
+    if let Some(errors) = v.get("errors") {
+        anyhow::bail!("oracle subgraph rejected the latest-day query: {errors}");
+    }
     num(v.pointer("/data/allocationDailyDataPoints/0/dayNumber"))
         .map(|n| n as i64)
         .context("oracle subgraph returned no dayNumber — cannot resolve a sync window")
 }
 
-/// Keyset-paginate one entity.
-async fn paginate(
+/// Fetch one keyset page.
+async fn fetch_page(
     client: &reqwest::Client,
     url: &str,
     entity: &str,
     fields: &str,
     day_gte: i64,
-    cfg: &OracleMirrorConfig,
+    last_id: &str,
 ) -> Result<Vec<Value>> {
-    let mut out: Vec<Value> = Vec::new();
-    let mut last_id = String::new();
-    for page in 0..cfg.max_pages.max(1) {
-        let q = json!({
-            "query": format!(
-                r#"{{ {entity}(first: 1000, orderBy: id, orderDirection: asc,
-                       where: {{ dayNumber_gte: {day_gte}, id_gt: "{last_id}" }})
-                     {{ {fields} }} }}"#
-            )
-        });
-        let v: Value = client
-            .post(url)
-            .json(&q)
-            .send()
-            .await
-            .with_context(|| format!("{entity} page {page} request failed"))?
-            .json()
-            .await
-            .with_context(|| format!("{entity} page {page} returned unparseable JSON"))?;
+    let q = json!({
+        "query": format!(
+            r#"{{ {entity}(first: 1000, orderBy: id, orderDirection: asc,
+                   where: {{ dayNumber_gte: {day_gte}, id_gt: "{last_id}" }})
+                 {{ {fields} }} }}"#
+        )
+    });
+    let v: Value = client
+        .post(url)
+        .json(&q)
+        .send()
+        .await
+        .with_context(|| format!("{entity} request failed"))?
+        .json()
+        .await
+        .with_context(|| format!("{entity} returned unparseable JSON"))?;
 
-        // A GraphQL error here means the query is wrong (a renamed field, a missing entity) and
-        // every later page would fail identically. Surface it instead of returning a short read
-        // that looks like the end of the data.
-        if let Some(errors) = v.get("errors") {
-            anyhow::bail!("{entity} query rejected by the oracle subgraph: {errors}");
-        }
-
-        let Some(items) = v.pointer(&format!("/data/{entity}")).and_then(|x| x.as_array()) else {
-            break;
-        };
-        if items.is_empty() {
-            break;
-        }
-        let full = items.len() == 1000;
-        last_id = items
-            .last()
-            .and_then(|r| r["id"].as_str())
-            .unwrap_or_default()
-            .to_string();
-        out.extend(items.iter().cloned());
-        if !full || last_id.is_empty() {
-            break;
-        }
-        if page + 1 == cfg.max_pages.max(1) {
-            // Never let a cap look like completeness.
-            warn!(entity, pages = cfg.max_pages, rows = out.len(),
-                  "Oracle mirror hit its page cap — this entity is INCOMPLETE for this cycle");
-        }
+    // A GraphQL error means the query is wrong (a renamed or non-existent field) and every later
+    // page would fail identically. Surface it rather than returning a short read that looks like
+    // the end of the data — that is how `QueryDailyDataPoint has no field
+    // subgraph_deployment_ipfs_hash` was caught instead of silently mirroring nothing.
+    if let Some(errors) = v.get("errors") {
+        anyhow::bail!("{entity} query rejected by the oracle subgraph: {errors}");
     }
-    Ok(out)
+
+    Ok(v.pointer(&format!("/data/{entity}"))
+        .and_then(|x| x.as_array())
+        .cloned()
+        .unwrap_or_default())
 }
 
 // ── Field readers ───────────────────────────────────────────────────────────
@@ -392,7 +429,8 @@ async fn upsert_query_daily(pool: &PgPool, rows: &[Value]) -> Result<u64> {
         .bind(int(r.get("dayStart")))
         .bind(int(r.get("dayEnd")))
         .bind(int(r.get("dataPointCount")))
-        .bind(text(r.get("subgraph_deployment_ipfs_hash")).unwrap_or_default());
+        // Nested, because this entity has no flat ipfs-hash field. See QUERY_DAILY_FIELDS.
+        .bind(text(r.pointer("/subgraphDeployment/id")).unwrap_or_default());
         let q = bind_numerics!(
             q, r,
             "avg_gateway_latency_ms", "max_gateway_latency_ms", "avg_query_fee", "max_query_fee",
