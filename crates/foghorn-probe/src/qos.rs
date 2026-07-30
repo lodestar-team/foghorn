@@ -79,13 +79,20 @@ pub async fn rollup_once(cfg: &QosRollupConfig, pool: &PgPool) -> Result<u64> {
                 o.latency_ms,
                 (o.error_class IS NULL AND o.http_status = 200) AS ok,
                 o.response_hash,
-                d.largest_by_stake_hash
+                d.largest_by_stake_hash,
+                -- How many indexers agreed on the majority answer for this probe. A "majority" of
+                -- one is not a majority, and judging against it is what produced a public claim
+                -- that a named indexer served wrong data on a sample where nothing was compared.
+                d.largest_by_count_size AS majority_size,
+                -- Deployments that diverge every round are the subgraph's fault, not an indexer's.
+                (nd.deployment_id IS NOT NULL) AS nondeterministic
             FROM observation o
             JOIN probe p ON p.id = o.probe_id
             JOIN allocation_map m
               ON m.allocation_key = o.indexer_address
              AND m.indexer_address IS NOT NULL
             LEFT JOIN divergence d ON d.probe_id = o.probe_id
+            LEFT JOIN nondeterministic_deployment nd ON nd.deployment_id = p.deployment_id
             WHERE p.dispatched_at >= NOW() - make_interval(secs => $2)
         ),
         agg AS (
@@ -107,12 +114,22 @@ pub async fn rollup_once(cfg: &QosRollupConfig, pool: &PgPool) -> Result<u64> {
                     FILTER (WHERE ok AND latency_ms IS NOT NULL) AS p95,
                 percentile_cont(0.99) WITHIN GROUP (ORDER BY latency_ms)
                     FILTER (WHERE ok AND latency_ms IS NOT NULL) AS p99,
+                -- A response counts as COMPARABLE only when at least two indexers agreed on a
+                -- majority answer for the same probe, and the deployment is not known to be
+                -- non-deterministic. Without those conditions a probe answered by a single indexer
+                -- yielded `comparable=1, divergent=1` — a minority of one, with no majority to
+                -- differ from — and published it as "serving wrong data" against a named operator.
                 count(*) FILTER (
-                    WHERE response_hash IS NOT NULL AND largest_by_stake_hash IS NOT NULL
+                    WHERE response_hash IS NOT NULL
+                      AND largest_by_stake_hash IS NOT NULL
+                      AND COALESCE(majority_size, 0) >= 2
+                      AND NOT nondeterministic
                 )                                            AS comparable_count,
                 count(*) FILTER (
                     WHERE response_hash IS NOT NULL
                       AND largest_by_stake_hash IS NOT NULL
+                      AND COALESCE(majority_size, 0) >= 2
+                      AND NOT nondeterministic
                       AND response_hash <> largest_by_stake_hash
                 )                                            AS divergent_count
             FROM obs

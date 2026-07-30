@@ -1217,6 +1217,7 @@ pub async fn qos_compare(
                  THEN 1.0 - (m.divergent::double precision / m.comparable::double precision)
                  ELSE NULL
             END                           AS mine_correctness_rate,
+            m.comparable                  AS mine_comparable,
             o.success_rate                AS oracle_success_rate,
             o.blocks_behind               AS oracle_blocks_behind,
             o.query_count                 AS oracle_query_count
@@ -1264,7 +1265,16 @@ pub async fn qos_compare(
         }
 
         // "The oracle is happy and we are not": high 200-rate over there, wrong data over here.
-        let blind = oracle_sr.unwrap_or(0.0) >= 0.99 && mine_correctness.is_some_and(|c| c < 1.0);
+        //
+        // Gated on the SAME evidence threshold as the aggregate. Publishing this without one named
+        // an indexer as serving wrong data on 7 probes, while the panel beside it declared that
+        // fewer than 20 probes is not evidence. A public accusation deserves at least the standard
+        // applied to a summary statistic.
+        let comparable: Option<i64> = r.try_get("mine_comparable").ok().flatten();
+        let blind = counted
+            && comparable.unwrap_or(0) >= min_probes
+            && oracle_sr.unwrap_or(0.0) >= 0.99
+            && mine_correctness.is_some_and(|c| c < 1.0);
         if blind {
             oracle_blind += 1;
         }
@@ -1278,6 +1288,9 @@ pub async fn qos_compare(
                 "success_rate": mine_sr,
                 "blocks_behind": r.get::<Option<f64>, _>("mine_blocks_behind"),
                 "correctness_rate": mine_correctness,
+                // The evidence behind the ratio. A correctness figure over one or two comparisons
+                // is not a finding, and hiding the denominator invites it being read as one.
+                "comparable_responses": comparable,
             },
             "oracle": {
                 "success_rate": oracle_sr,
