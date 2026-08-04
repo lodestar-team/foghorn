@@ -118,6 +118,12 @@ pub async fn sync_once(
     // The oracle's dayNumber epoch is its own, so the floor is derived from the newest day the
     // oracle itself reports rather than from our clock. Doing it the other way round would silently
     // sync nothing whenever the two calendars disagreed.
+    // Diagnostic first: if the subgraph is rejecting messages, the sync below will faithfully
+    // mirror a dataset that stopped advancing, and nothing else would reveal why.
+    if let Err(e) = check_subgraph_health(&client, &url, pool).await {
+        warn!(error = %e, "Oracle subgraph health check failed");
+    }
+
     let latest = latest_day(&client, &url).await?;
     let floor = latest.saturating_sub(cfg.window_days.max(1) as i64 - 1);
     info!(latest_day = latest, day_floor = floor, "Oracle mirror window resolved");
@@ -236,6 +242,78 @@ async fn save_cursor(pool: &PgPool, entity: &str, last_id: &str, complete: bool,
     .bind(rows as i64)
     .execute(pool)
     .await;
+}
+
+
+/// Check whether the oracle's subgraph is ACCEPTING the publisher's messages.
+///
+/// Added after discovering the subgraph had rejected every message for 34 days while looking
+/// perfectly healthy — at chain tip, no indexing errors, simply refusing each post with
+/// "…is not a valid submitter." and therefore materialising nothing. Publisher liveness (v12) could
+/// not see it, and a populated mirror could not either.
+///
+/// Failures here are logged, never fatal: this is a diagnostic, and losing it must not stop the
+/// mirror from syncing whatever data does exist.
+async fn check_subgraph_health(client: &reqwest::Client, url: &str, pool: &PgPool) -> Result<()> {
+    let q = json!({
+        "query": "{ _meta { block { number } hasIndexingErrors } \
+                    oracleMessages(first: 1, orderBy: createdAt, orderDirection: desc) \
+                      { createdAt valid errorMessage } \
+                    allocationDailyDataPoints(first: 1, orderBy: dayNumber, orderDirection: desc) \
+                      { dayNumber dayStart } }"
+    });
+    let v: Value = client.post(url).json(&q).send().await?.json().await?;
+    if let Some(errors) = v.get("errors") {
+        anyhow::bail!("subgraph health query rejected: {errors}");
+    }
+
+    let indexed_block = int(v.pointer("/data/_meta/block/number"));
+    let has_errors = v
+        .pointer("/data/_meta/hasIndexingErrors")
+        .and_then(|x| x.as_bool());
+    let msg_at = int(v.pointer("/data/oracleMessages/0/createdAt"));
+    let msg_valid = v
+        .pointer("/data/oracleMessages/0/valid")
+        .and_then(|x| x.as_bool());
+    let msg_error = text(v.pointer("/data/oracleMessages/0/errorMessage"));
+    let day = int(v.pointer("/data/allocationDailyDataPoints/0/dayNumber"));
+    let day_start = int(v.pointer("/data/allocationDailyDataPoints/0/dayStart"));
+
+    // Loud, because this is the failure mode that hid for a month.
+    if msg_valid == Some(false) {
+        warn!(
+            error = msg_error.as_deref().unwrap_or("unknown"),
+            newest_valid_day = day,
+            "CANONICAL SUBGRAPH IS REJECTING THE PUBLISHER'S MESSAGES — no new data is being \
+             materialised even though the publisher is posting"
+        );
+    }
+
+    sqlx::query(
+        r#"INSERT INTO oracle_subgraph_health
+               (id, indexed_block, has_indexing_errors, newest_message_at, newest_message_valid,
+                newest_message_error, newest_valid_day, newest_valid_day_start, checked_at)
+           VALUES (TRUE, $1, $2, to_timestamp($3), $4, $5, $6, to_timestamp($7), NOW())
+           ON CONFLICT (id) DO UPDATE SET
+               indexed_block = EXCLUDED.indexed_block,
+               has_indexing_errors = EXCLUDED.has_indexing_errors,
+               newest_message_at = EXCLUDED.newest_message_at,
+               newest_message_valid = EXCLUDED.newest_message_valid,
+               newest_message_error = EXCLUDED.newest_message_error,
+               newest_valid_day = EXCLUDED.newest_valid_day,
+               newest_valid_day_start = EXCLUDED.newest_valid_day_start,
+               checked_at = NOW()"#,
+    )
+    .bind(indexed_block)
+    .bind(has_errors)
+    .bind(msg_at.map(|v| v as f64))
+    .bind(msg_valid)
+    .bind(msg_error)
+    .bind(day.map(|d| d as i32))
+    .bind(day_start.map(|v| v as f64))
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 /// The newest `dayNumber` the oracle has published.

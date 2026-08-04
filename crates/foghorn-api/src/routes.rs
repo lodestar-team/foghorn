@@ -1158,9 +1158,58 @@ pub async fn qos_canonical(
     .await
     .unwrap_or((None, None));
 
+    // The mirror's OWN data age, and the subgraph's acceptance state. Reporting only the
+    // publisher's liveness let a 34-day hole hide in plain sight: the publisher was posting, the
+    // subgraph was at chain tip with no indexing errors, and it rejected every message with
+    // "not a valid submitter" — so the newest data any consumer could get was 2026-07-01 while
+    // everything on the page looked alive. Three separate questions, all of which must be answered.
+    let (newest_day_start, mirror_rows): (Option<i64>, i64) = sqlx::query_as(
+        "SELECT max(day_start), count(*) FROM oracle_allocation_daily",
+    )
+    .fetch_one(&state.pool)
+    .await
+    .unwrap_or((None, 0));
+
+    let subgraph: Option<(
+        Option<i64>,
+        Option<bool>,
+        Option<chrono::DateTime<chrono::Utc>>,
+        Option<bool>,
+        Option<String>,
+    )> = sqlx::query_as(
+        "SELECT indexed_block, has_indexing_errors, newest_message_at, newest_message_valid,
+                newest_message_error
+         FROM oracle_subgraph_health WHERE id = TRUE",
+    )
+    .fetch_optional(&state.pool)
+    .await
+    .unwrap_or(None);
+
+    let now_secs = chrono::Utc::now().timestamp();
+    let data_age_seconds = newest_day_start.map(|d| now_secs - d);
+
     Ok(Json(json!({
         "source": "edgeandnode-qos-oracle",
         "served_by": "lodestar-mirror",
+        // How old the newest CANONICAL DATA is — not how recently we synced, and not whether the
+        // publisher posted. This is the number that was missing.
+        "data": {
+            "newest_day_start": newest_day_start,
+            "age_seconds": data_age_seconds,
+            "rows": mirror_rows,
+            "note": "Age of the newest data the canonical oracle has actually published. If this is \
+                     days old while the publisher looks live, the subgraph is not materialising \
+                     posts — check `subgraph` below.",
+        },
+        "subgraph": subgraph.map(|(block, errs, msg_at, msg_valid, msg_err)| json!({
+            "indexed_block": block,
+            "has_indexing_errors": errs,
+            "newest_message_at": msg_at.map(|t| t.to_rfc3339()),
+            "newest_message_accepted": msg_valid,
+            "rejection_reason": msg_err,
+            "note": "A subgraph can be at chain tip with no indexing errors and still accept none \
+                     of the publisher's messages, producing no data at all.",
+        })),
         "what": "Edge & Node's published QoS, mirrored. Real gateway traffic: genuine query counts, \
                  fees and success rates — not probes.",
         "publisher": {
