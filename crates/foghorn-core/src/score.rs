@@ -202,11 +202,12 @@ fn coverage_score(i: &ScoreInputs, cfg: &ScoringConfig) -> Option<f64> {
 /// one, arrived at from the opposite direction.
 ///
 /// An indexer that is active but unmeasured comes back NR: not damning, just honest.
-/// A high-stake idle indexer is the exception: that's a leech, and is rated on that basis alone.
+///
+/// Being a leech used to force `rated`, because verdicts were only emitted for rated indexers and
+/// the leech verdict is worth emitting. That coupling put two never-probed operators on the board
+/// at A-100 — the leech finding is about *idle stake*, which is on-chain and visible, and says
+/// nothing about service quality. The two are now separate: see `STRUCTURAL_VERDICTS`.
 fn is_rated(i: &ScoreInputs, cfg: &ScoringConfig) -> bool {
-    if is_leech(i, cfg) {
-        return true;
-    }
     let active = i.probes_answered > 0
         || i.qos_query_count.map(|q| q > 0).unwrap_or(false)
         || i.allocation_count.map(|n| n > 0).unwrap_or(false);
@@ -222,13 +223,20 @@ fn unrated_reason(i: &ScoreInputs, cfg: &ScoringConfig) -> String {
     let active = i.probes_answered > 0
         || i.qos_query_count.map(|q| q > 0).unwrap_or(false)
         || i.allocation_count.map(|n| n > 0).unwrap_or(false);
-    if active {
-        let _ = cfg;
+    if is_leech(i, cfg) {
+        "not rated — stake is idle, and Lodestar has not measured this indexer in the window"
+            .to_string()
+    } else if active {
         "not rated — active, but Lodestar has not measured this indexer in the window".to_string()
     } else {
         "inactive — no queries, allocations, or probe coverage".to_string()
     }
 }
+
+/// Verdicts that stand on facts we hold regardless of whether we ever probed the indexer: stake,
+/// allocation count, sybil clustering. Everything else describes observed behaviour, and stating it
+/// about an operator we have not observed would be an invention.
+const STRUCTURAL_VERDICTS: [&str; 3] = ["leech", "low-coverage", "sybil-swarm-member"];
 
 /// Compute the full judgement for one (indexer, window). Pure.
 pub fn judge(i: &ScoreInputs, cfg: &ScoringConfig) -> ScoreOutcome {
@@ -254,7 +262,15 @@ pub fn judge(i: &ScoreInputs, cfg: &ScoringConfig) -> ScoreOutcome {
                 "coverage": null, "value": null
             }),
         };
-        return ScoreOutcome { score, verdicts: vec![], attention: vec![] };
+        // Unrated does not mean unremarkable. These verdicts rest on on-chain and profile facts —
+        // stake sat idle, allocations spread too thin — which we can see perfectly well without
+        // having probed anyone. Withholding them because the *grade* is unavailable would be the
+        // same conflation in reverse.
+        let verdicts = derive_verdicts(i, cfg, 0.0)
+            .into_iter()
+            .filter(|v| STRUCTURAL_VERDICTS.contains(&v.kind.as_str()))
+            .collect();
+        return ScoreOutcome { score, verdicts, attention: vec![] };
     }
 
     let correctness = correctness_score(i);
@@ -774,8 +790,9 @@ mod tests {
         assert!(out.attention.is_empty());
     }
 
+    /// Idle stake is a finding about stake, not about service — so it is reported without a grade.
     #[test]
-    fn high_stake_idle_is_rated_leech() {
+    fn high_stake_idle_is_flagged_leech_but_not_graded() {
         let i = ScoreInputs {
             indexer_address: "0xleech".to_string(),
             window_days: 7,
@@ -784,8 +801,30 @@ mod tests {
             ..Default::default()
         };
         let out = judge(&i, &cfg());
-        assert!(out.score.rated);
         assert!(out.verdicts.iter().any(|v| v.kind == "leech"));
+        // Never probed, so there is nothing to grade — and an A here would be a lie about quality.
+        assert!(!out.score.rated);
+        assert_eq!(out.score.grade, "NR");
+    }
+
+    /// Behaviour verdicts must not leak out for an indexer we never observed.
+    #[test]
+    fn unrated_indexer_gets_no_behaviour_verdicts() {
+        let i = ScoreInputs {
+            indexer_address: "0xleech".to_string(),
+            window_days: 7,
+            self_stake_grt: Some(5_000_000.0),
+            qos_query_count: Some(0),
+            ..Default::default()
+        };
+        let out = judge(&i, &cfg());
+        for v in &out.verdicts {
+            assert!(
+                STRUCTURAL_VERDICTS.contains(&v.kind.as_str()),
+                "behaviour verdict {} emitted for an unmeasured indexer",
+                v.kind
+            );
+        }
     }
 
     /// An indexer we have never measured must not be graded on its allocation count alone.
