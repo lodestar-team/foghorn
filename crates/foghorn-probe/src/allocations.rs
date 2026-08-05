@@ -179,3 +179,32 @@ pub struct PayableTarget {
     pub deployment_id: String,
     pub indexer_url: Option<String>,
 }
+
+/// Payable targets for one deployment.
+///
+/// The per-deployment form exists because probes are organised by deployment: asking for a global
+/// list and filtering in the scheduler would pull thousands of rows to use a handful, on every
+/// query of every round.
+pub async fn payable_targets_for_deployment(
+    pool: &PgPool,
+    deployment_id: &str,
+    excluded: &[String],
+) -> Result<Vec<PayableTarget>> {
+    let lowered: Vec<String> = excluded.iter().map(|e| e.to_lowercase()).collect();
+    let rows = sqlx::query_as::<_, PayableTarget>(
+        r#"SELECT a.allocation_id, a.indexer_address, a.deployment_id, a.indexer_url
+           FROM active_allocation a
+           JOIN tap_escrow e ON e.indexer_address = a.indexer_address
+           WHERE a.deployment_id = $1
+             AND a.indexer_url IS NOT NULL
+             AND a.indexer_url <> ''
+             AND e.balance_wei > 0
+             AND NOT (a.indexer_address = ANY($2))
+           ORDER BY a.allocated_tokens DESC NULLS LAST"#,
+    )
+    .bind(deployment_id)
+    .bind(&lowered)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}

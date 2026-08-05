@@ -1,7 +1,10 @@
 use crate::{
     cluster::{compute_clusters, ClusterInput},
     discovery::{get_opted_in_indexers, get_safe_block},
-    executor::{execute_gateway_probe, execute_probe, GatewayProbeRequest, ProbeRequest, RawObservation},
+    executor::{
+        execute_gateway_probe, execute_paid_probe, execute_probe, GatewayProbeRequest,
+        PaidProbeRequest, ProbeRequest, RawObservation,
+    },
 };
 use anyhow::Result;
 use chrono::Utc;
@@ -34,8 +37,26 @@ pub async fn run_probe_scheduler(config: FoghornConfig, pool: PgPool) -> Result<
         warn!("No test sets found in '{}' — probe scheduler will idle", config.test_sets_dir);
     }
 
+    // Built once, before the loop. Absent when TAP is disabled or unconfigured, in which case
+    // probing continues through the gateway exactly as before — a missing signer key must degrade
+    // to the old behaviour, not to silence.
+    let paid: Option<(tap_query::PaidQueryClient, usize)> = if config.tap.enabled {
+        match build_paid_client(&config) {
+            Ok(c) => {
+                info!(payer = %config.tap.payer, "Paid direct dispatch enabled");
+                Some(c)
+            }
+            Err(e) => {
+                warn!(error = %e, "TAP enabled but the client could not be built — falling back to gateway dispatch");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     loop {
-        match run_probe_round(&config, &pool, &test_sets).await {
+        match run_probe_round(&config, &pool, &test_sets, paid.as_ref()).await {
             Ok(n) => info!(probes = n, "Probe round complete"),
             Err(e) => error!(error = %e, "Probe round failed"),
         }
@@ -55,6 +76,9 @@ async fn run_probe_round(
     config: &FoghornConfig,
     pool: &PgPool,
     test_sets: &[TestSet],
+    // Some(client, max_targets) when TAP is configured. Built once per round rather than per query:
+    // constructing it parses a key and builds an HTTP client, neither of which belongs in a loop.
+    paid_client: Option<&(tap_query::PaidQueryClient, usize)>,
 ) -> Result<usize> {
     let mut total_probes = 0;
 
@@ -107,7 +131,52 @@ async fn run_probe_round(
                 let probe_id = Uuid::new_v4();
                 let now = Utc::now();
 
-                let raw_observations = if let Some(gw) = &config.gateway {
+                // Paid direct dispatch takes priority when enabled and there are indexers we can
+                // actually pay for this deployment. It is the only mode where WE choose who
+                // answers, which is what makes the resulting success rate a measurement rather
+                // than an upper bound.
+                //
+                // Falls back to the gateway rather than skipping: escrow propagation is slow (an
+                // indexer's tap-agent has to observe the deposit before it stops denylisting us),
+                // so early on most deployments have no payable target and gateway coverage is
+                // better than none.
+                let paid_targets: Vec<crate::allocations::PayableTarget> = if let Some(tap) = paid_client.as_ref() {
+                    crate::allocations::payable_targets_for_deployment(
+                        pool,
+                        &test_set.deployment.ipfs_hash,
+                        &config.tap.excluded_indexers,
+                    )
+                    .await
+                    .unwrap_or_default()
+                    .into_iter()
+                    .take(tap.1)
+                    .collect()
+                } else {
+                    Vec::new()
+                };
+
+                let raw_observations = if let (Some((client, _)), false) =
+                    (paid_client.as_ref(), paid_targets.is_empty())
+                {
+                    let mut obs = Vec::new();
+                    for target in &paid_targets {
+                        let req = PaidProbeRequest {
+                            indexer_address: target.indexer_address.clone(),
+                            indexer_url: target.indexer_url.clone().unwrap_or_default(),
+                            allocation_id: target.allocation_id.clone(),
+                            deployment_ipfs_hash: test_set.deployment.ipfs_hash.clone(),
+                            query: final_query.clone(),
+                            block_hash: block_hash.clone(),
+                            stake_weight: 1.0,
+                        };
+                        obs.push(execute_paid_probe(client, req).await);
+                        if config.max_qps_per_indexer > 0.0 {
+                            let delay_ms = (1000.0 / config.max_qps_per_indexer) as u64;
+                            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                        }
+                    }
+                    obs
+                } else if let Some(gw) = &config.gateway {
                     // Gateway mode: fire probe_count queries, each may come from a different indexer
                     let subgraph_id = test_set
                         .deployment
@@ -315,4 +384,35 @@ fn load_test_sets(dir: &str) -> Result<Vec<TestSet>> {
         }
     }
     Ok(test_sets)
+}
+
+/// Build the paid-query client from config.
+///
+/// Kept separate so a misconfiguration is one clear error at startup rather than a failure per
+/// probe. The signer key is read from config (env `FOGHORN__TAP__SIGNER_KEY` in production) and
+/// never logged: it signs receipts, so leaking it lets someone spend the escrow.
+fn build_paid_client(
+    config: &FoghornConfig,
+) -> anyhow::Result<(tap_query::PaidQueryClient, usize)> {
+    let key = config
+        .tap
+        .signer_key
+        .as_deref()
+        .filter(|k| !k.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("tap.signer_key is not set"))?;
+    let signer: tap_query::PrivateKeySigner =
+        key.parse().map_err(|_| anyhow::anyhow!("tap.signer_key is not a valid private key"))?;
+
+    let ctx = tap_query::PaymentContext {
+        chain_id: tap_query::ARBITRUM_ONE_CHAIN_ID,
+        verifier: config.tap.verifier.parse()?,
+        data_service: config.tap.data_service.parse()?,
+        payer: config.tap.payer.parse()?,
+    };
+    let client = tap_query::PaidQueryClient::new(signer, ctx, Duration::from_secs(30))?;
+    // Cap targets per deployment so one very widely-allocated subgraph cannot consume a whole
+    // round's budget. Reuses the gateway's probe_count, which is already the "how many opinions do
+    // we want per query" knob.
+    let max_targets = config.gateway.as_ref().map(|g| g.probe_count as usize).unwrap_or(8);
+    Ok((client, max_targets))
 }

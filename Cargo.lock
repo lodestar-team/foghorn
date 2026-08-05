@@ -6129,7 +6129,7 @@ checksum = "55937e1799185b12863d447f42597ed69d9928686b8d88a1df17376a097d8369"
 [[package]]
 name = "tap-query"
 version = "0.1.0"
-source = "git+https://github.com/nightswatchhq/tap-query?branch=main#4f4b31f75e7aad270fd7799d612c4fb31fe36d1c"
+source = "git+https://github.com/nightswatchhq/tap-query?branch=main#2a8fba938c1a52aa4c098423fdb94019ea107513"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -7076,7 +7076,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
