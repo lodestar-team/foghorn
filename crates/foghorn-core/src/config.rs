@@ -81,6 +81,12 @@ pub struct ScoringConfig {
     pub serving_grade_penalty: f64,  // composite multiplier removed when ALL measured deployments error (0..1)
     pub serving_min_deployments: i64, // min materially-queried deployments before the serving penalty applies
     pub serving_broken_count_ref: i64, // erroring-deployment count at which the absolute-count penalty saturates
+    /// Probes on one (indexer, deployment) before its serving health counts.
+    ///
+    /// Replaces the old `query_count >= 100` gate, which was tuned for the canonical oracle's real
+    /// gateway traffic. Probes arrive on `probe_interval_secs` (3600 in production), so 100 would
+    /// mean four days of uninterrupted probing per deployment and almost nothing would ever qualify.
+    pub serving_min_probes: i64,
 }
 
 impl Default for ScoringConfig {
@@ -130,6 +136,9 @@ impl Default for ScoringConfig {
             // ~600 → out of A). The broadly-dead (datanexus/pinax: ~all broken) still
             // hit F via the fraction term.
             serving_broken_count_ref: 20,
+            // Ten probes is enough that a single timeout cannot push a deployment under 50%, and
+            // low enough to qualify within a day of hourly probing.
+            serving_min_probes: 10,
         }
     }
 }

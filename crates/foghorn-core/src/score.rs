@@ -1,15 +1,25 @@
 //! The judgement core — pure, I/O-free, unit-tested.
 //!
-//! Foghorn fuses its own correctness signal (block-pinned divergence probing —
-//! the one thing the QoS oracle can't see) with Lodestar-sourced QoS / stake /
-//! REO data and direct `/status` health, then emits:
+//! Scored on what Foghorn measures: block-pinned divergence probing (correctness — the one thing
+//! the QoS oracle cannot see), observed errors and per-deployment serving health (availability),
+//! measured chainhead lag (freshness), and on-chain allocation count (coverage). Emits:
 //!   - a composite 0..100 network-quality score + A..F grade,
 //!   - actionable verdicts (naming names), and
 //!   - "needs attention" items (current, high-confidence, fix-this-now problems).
 //!
-//! Every sub-score is 0..100, higher = better. Missing signals are simply
-//! omitted from the weighted mean (weights renormalise over what's present), so
-//! an indexer with no probe coverage is still graded on QoS/coverage/value.
+//! The canonical QoS oracle is no longer an input to any sub-score. It was, until it emerged that
+//! its subgraph had published nothing since 2026-07-01 while answering queries exactly as a live
+//! one does: a grade that is part live measurement and part month-old memory cannot tell you which
+//! part is which, and neither can the operator being graded. Its figures are still ingested,
+//! served and compared against — just never silently blended into a judgement.
+//!
+//! Query volume was dropped as a component rather than left at zero. Volume is *demand* — which
+//! indexers a gateway chose to route to — and no amount of probing reproduces it. Scoring
+//! operators on a number we cannot measure was rewarding and punishing them for our blind spot.
+//!
+//! Every sub-score is 0..100, higher = better. Missing signals are omitted from the weighted mean
+//! (weights renormalise over what's present) rather than defaulted, because a zero is a verdict and
+//! an absent measurement is not.
 
 use crate::config::ScoringConfig;
 use crate::types::{AttentionItem, IndexerScore, Severity, Verdict};

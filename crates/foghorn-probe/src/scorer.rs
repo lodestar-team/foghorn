@@ -59,7 +59,7 @@ pub async fn run_score_once(cfg: &ScoringConfig, api_key: Option<&str>, pool: &P
     }
 
     let profiles = load_profiles(pool).await?;
-    let alloc_health = load_alloc_health(pool).await?;
+    let alloc_health = load_alloc_health(pool, cfg).await?;
     let measured_lag = load_measured_lag(pool).await?;
     let recent = load_probe_agg(pool, "6 hours").await?;
 
@@ -98,7 +98,7 @@ pub async fn run_score_once(cfg: &ScoringConfig, api_key: Option<&str>, pool: &P
     // Per-(indexer, deployment) issues from the oracle's allocation QoS — catches
     // "synced but serving errors on subgraph X" and genuine per-deployment lag,
     // allocation-scoped (never flags an indexer merely syncing a deployment).
-    match detect_allocation_issues(pool).await {
+    match detect_allocation_issues(pool, cfg).await {
         Ok(n) => info!(items = n, "Per-deployment QoS check complete"),
         Err(e) => warn!(error = %e, "Per-deployment QoS check failed"),
     }
@@ -287,16 +287,31 @@ const PER_DEPLOYMENT_LAG_MARGIN: f64 = 50_000.0;
 /// indexer-level item (it's an indexer-wide outage, not N subgraph issues).
 const ROLLUP_THRESHOLD: usize = 5;
 
-async fn detect_allocation_issues(pool: &PgPool) -> Result<usize> {
+async fn detect_allocation_issues(pool: &PgPool, cfg: &ScoringConfig) -> Result<usize> {
     let mut n = 0usize;
 
-    // 1. Serving errors on specific deployments (low success, real volume).
+    // 1. Serving errors on specific deployments (low success, enough probes to mean something).
+    //
+    // From `foghorn_qos`, not the canonical oracle's `allocation_qos`. These items name an operator
+    // and a subgraph on the public dashboard; sourcing them from a feed frozen since 2026-07-01
+    // would keep accusing indexers of outages that may have ended a month ago, with the item's
+    // timestamp claiming otherwise.
     let errs = sqlx::query(
-        r#"SELECT indexer_address, deployment_id, success_rate, query_count
-           FROM allocation_qos
-           WHERE query_count >= 100 AND success_rate < 0.5
-           ORDER BY indexer_address, query_count DESC"#,
+        r#"SELECT addr AS indexer_address, deployment_id,
+                  ok::float8 / probes::float8 AS success_rate,
+                  probes AS query_count
+           FROM (
+               SELECT LOWER(indexer_address) AS addr, deployment_id,
+                      SUM(query_count) AS probes, SUM(num_indexer_200_responses) AS ok
+               FROM foghorn_qos
+               WHERE bucket_start >= NOW() - ($1 || ' days')::interval
+               GROUP BY 1, 2
+           ) d
+           WHERE probes >= $2 AND ok::float8 / probes::float8 < 0.5
+           ORDER BY addr, probes DESC"#,
     )
+    .bind(cfg.windows.iter().max().copied().unwrap_or(30))
+    .bind(cfg.serving_min_probes)
     .fetch_all(pool)
     .await?;
     let mut by_indexer: HashMap<String, Vec<(String, f64, i64)>> = HashMap::new();
@@ -321,7 +336,7 @@ async fn detect_allocation_issues(pool: &PgPool) -> Result<usize> {
                 title: format!("Serving errors across {} deployments (indexer-wide)", deps.len()),
                 detail: serde_json::json!({
                     "deployment_count": deps.len(),
-                    "total_queries": total_q,
+                    "total_probes": total_q,
                     "deployments": deployments,
                 }),
             };
@@ -335,8 +350,8 @@ async fn detect_allocation_issues(pool: &PgPool) -> Result<usize> {
                     deployment_id: dep.clone(),
                     severity: Severity::Critical,
                     urgency: 95.0 + (1.0 - sr) * 5.0,
-                    title: format!("Serving errors on a deployment ({:.0}% success over {} queries)", sr * 100.0, qc),
-                    detail: serde_json::json!({ "success_rate": sr, "query_count": qc }),
+                    title: format!("Serving errors on a deployment ({:.0}% success over {} probes)", sr * 100.0, qc),
+                    detail: serde_json::json!({ "success_rate": sr, "probe_count": qc }),
                 };
                 upsert_attention(pool, &item).await?;
                 n += 1;
@@ -345,20 +360,36 @@ async fn detect_allocation_issues(pool: &PgPool) -> Result<usize> {
     }
 
     // 2. Behind the freshest serving peer on specific deployments.
+    //
+    // The peer floor is computed over the same window and the same feed, so "behind the freshest
+    // serving peer" compares indexers measured at the same time by the same prober. Mixing a live
+    // reading against a month-old floor would manufacture lag out of nothing but the clock.
     let lags = sqlx::query(
-        r#"WITH baseline AS (
+        r#"WITH recent AS (
+               SELECT LOWER(indexer_address) AS addr, deployment_id,
+                      AVG(avg_indexer_blocks_behind) AS blocks_behind,
+                      SUM(query_count) AS probes
+               FROM foghorn_qos
+               WHERE bucket_start >= NOW() - ($2 || ' days')::interval
+                 AND avg_indexer_blocks_behind IS NOT NULL
+               GROUP BY 1, 2
+           ),
+           baseline AS (
                SELECT deployment_id, MIN(blocks_behind) AS floor, COUNT(*) AS peers
-               FROM allocation_qos GROUP BY deployment_id
+               FROM recent WHERE probes >= $3 GROUP BY deployment_id
            )
-           SELECT a.indexer_address, a.deployment_id, a.blocks_behind, b.floor, b.peers
-           FROM allocation_qos a
+           SELECT a.addr AS indexer_address, a.deployment_id, a.blocks_behind, b.floor, b.peers
+           FROM recent a
            JOIN baseline b ON b.deployment_id = a.deployment_id
            WHERE b.peers >= 3
+             AND a.probes >= $3
              AND a.blocks_behind > b.floor + $1
              AND a.blocks_behind > $1
-           ORDER BY a.indexer_address, a.blocks_behind DESC"#,
+           ORDER BY a.addr, a.blocks_behind DESC"#,
     )
     .bind(PER_DEPLOYMENT_LAG_MARGIN)
+    .bind(cfg.windows.iter().max().copied().unwrap_or(30))
+    .bind(cfg.serving_min_probes)
     .fetch_all(pool)
     .await?;
     let mut lag_by_indexer: HashMap<String, Vec<(String, f64, f64)>> = HashMap::new();
@@ -452,16 +483,34 @@ async fn load_profiles(pool: &PgPool) -> Result<HashMap<String, Profile>> {
 
 /// Per-indexer deployment-serving health from the oracle's allocation QoS:
 /// (materially-queried deployments, erroring deployments). "Erroring" mirrors
-/// detect_allocation_issues (query_count >= 100 AND success_rate < 0.5), so the
-/// grade penalty and the needs-attention items agree on what "broken" means.
-async fn load_alloc_health(pool: &PgPool) -> Result<HashMap<String, (i64, i64)>> {
+/// detect_allocation_issues, so the grade penalty and the needs-attention items agree on what
+/// "broken" means.
+///
+/// Read from `foghorn_qos` — our own probes — rather than `allocation_qos`, which holds the
+/// canonical oracle's numbers. That feed has published nothing since 2026-07-01 while continuing
+/// to answer queries normally, so every grade computed from it was scoring a month-old snapshot
+/// and had no way to say so. A per-deployment penalty is an accusation; making one from data that
+/// old, against operators who may have fixed the problem weeks ago, is the same failure as reading
+/// an absent measurement as a healthy one.
+async fn load_alloc_health(pool: &PgPool, cfg: &ScoringConfig) -> Result<HashMap<String, (i64, i64)>> {
     let rows = sqlx::query(
-        r#"SELECT LOWER(indexer_address) AS addr,
-                  COUNT(*) FILTER (WHERE query_count >= 100)::bigint AS measured,
-                  COUNT(*) FILTER (WHERE query_count >= 100 AND success_rate < 0.5)::bigint AS erroring
-           FROM allocation_qos
-           GROUP BY LOWER(indexer_address)"#,
+        r#"WITH per_dep AS (
+               SELECT LOWER(indexer_address) AS addr,
+                      deployment_id,
+                      SUM(query_count)               AS probes,
+                      SUM(num_indexer_200_responses) AS ok
+               FROM foghorn_qos
+               WHERE bucket_start >= NOW() - ($1 || ' days')::interval
+               GROUP BY 1, 2
+           )
+           SELECT addr,
+                  COUNT(*) FILTER (WHERE probes >= $2)::bigint AS measured,
+                  COUNT(*) FILTER (WHERE probes >= $2 AND ok::float8 / probes::float8 < 0.5)::bigint AS erroring
+           FROM per_dep
+           GROUP BY addr"#,
     )
+    .bind(cfg.windows.iter().max().copied().unwrap_or(30))
+    .bind(cfg.serving_min_probes)
     .fetch_all(pool)
     .await?;
     let mut map = HashMap::new();
