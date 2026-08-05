@@ -15,6 +15,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
+tap-query = { git = "https://github.com/nightswatchhq/tap-query", branch = "main" }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }

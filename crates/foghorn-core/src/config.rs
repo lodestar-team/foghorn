@@ -269,6 +269,66 @@ impl Default for OracleMirrorConfig {
     }
 }
 
+/// Paying indexers directly, instead of routing probes through Edge & Node's gateway.
+///
+/// This is what makes the measurement honest. Probes dispatched through a gateway are routed to
+/// indexers it already believes are healthy, so failures it avoids are invisible and any success
+/// rate computed from them is an upper bound rather than a measurement. Paying directly means we
+/// choose who answers.
+///
+/// Requires, on-chain and in this order: the signer authorised on GraphTallyCollector, and escrow
+/// deposited for each (payer, collector, receiver) tuple. Escrow is PER INDEXER, so coverage costs
+/// locked capital rather than fees.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct TapConfig {
+    pub enabled: bool,
+    /// The prober's signing key. Signs receipts and nothing else — it holds no funds and cannot
+    /// move any, which is why it is the key that belongs on a server. Set via
+    /// `FOGHORN__TAP__SIGNER_KEY`; never commit it.
+    pub signer_key: Option<String>,
+    /// The escrow account that authorised the signer. Recovered from the signature by the indexer,
+    /// so it must match what was funded.
+    pub payer: String,
+    /// GraphTallyCollector — the EIP-712 verifying contract.
+    pub verifier: String,
+    /// SubgraphService. Checked by the indexer's DataServiceCheck.
+    pub data_service: String,
+    /// PaymentsEscrow, for reading balances.
+    pub escrow: String,
+    /// Value per receipt, in the escrow token's smallest unit. Must clear the indexer's cost model:
+    /// `MinimumValue` rejects an underpriced receipt, which reads as a refusal to serve.
+    pub receipt_value: u128,
+    /// How often to re-read escrow balances on-chain.
+    pub escrow_sync_secs: u64,
+    /// How often to refresh active allocations from the network subgraph.
+    pub allocation_sync_secs: u64,
+    /// Indexers never to probe, whatever their allocations say — retiring operators, opt-outs.
+    /// Probing them produces failures that describe our target list rather than their health.
+    pub excluded_indexers: Vec<String>,
+}
+
+impl Default for TapConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            signer_key: None,
+            payer: String::new(),
+            // Arbitrum One. GraphTallyCollector cross-checked on-chain against
+            // SubgraphService.getGraphTallyCollector().
+            verifier: "0x8f69F5C07477Ac46FBc491B1E6D91E2bb0111A9e".to_string(),
+            data_service: "0xb2Bb92d0DE618878E438b55D5846cfecD9301105".to_string(),
+            escrow: "0xf6Fcc27aAf1fcD8B254498c9794451d82afC673E".to_string(),
+            // ~0.001 GRT. Comfortably above observed cost models (~0.00073 GRT/query network-wide)
+            // without overpaying by an order of magnitude.
+            receipt_value: 1_000_000_000_000_000u128,
+            escrow_sync_secs: 900,
+            allocation_sync_secs: 1800,
+            excluded_indexers: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Clone)]
 #[serde(default)]
 pub struct FoghornConfig {
@@ -294,6 +354,7 @@ pub struct FoghornConfig {
     pub qos_rollup: QosRollupConfig,
     pub data_edge: DataEdgeConfig,
     pub oracle_mirror: OracleMirrorConfig,
+    pub tap: TapConfig,
     /// Discord webhook URL for #foghorn-alerts. When set, new critical
     /// needs-attention items are pushed to Discord. Empty = alerting disabled.
     pub alert_webhook: Option<String>,
@@ -330,6 +391,7 @@ impl Default for FoghornConfig {
             qos_rollup: QosRollupConfig::default(),
             data_edge: DataEdgeConfig::default(),
             oracle_mirror: OracleMirrorConfig::default(),
+            tap: TapConfig::default(),
             alert_webhook: None,
         }
     }

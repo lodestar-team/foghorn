@@ -5,10 +5,12 @@ use foghorn_core::{
 use tracing::info;
 
 mod alerter;
+mod allocations;
 mod autodiscover;
 mod cluster;
 mod dataedge;
 mod discovery;
+mod escrow;
 mod executor;
 mod ingest;
 mod lodestar;
@@ -71,6 +73,30 @@ async fn main() -> anyhow::Result<()> {
         let de_cfg = config.data_edge.clone();
         let pool = pool.clone();
         tokio::spawn(async move { dataedge::run_dataedge_loop(de_cfg, pool).await });
+    }
+
+    // Paying indexers directly needs two things kept fresh: which allocation to bill, and which
+    // indexers we hold escrow with. Both are read from their sources rather than assumed.
+    if config.tap.enabled {
+        {
+            let api_key = config.gateway.as_ref().map(|g| g.api_key.clone());
+            let secs = config.tap.allocation_sync_secs;
+            let pool = pool.clone();
+            tokio::spawn(async move { allocations::run_allocation_sync_loop(api_key, secs, pool).await });
+        }
+        {
+            let tap = config.tap.clone();
+            // Arbitrum One, where escrow lives. Falls back to the public endpoint.
+            let rpc = config
+                .rpc_urls
+                .get("arbitrum-one")
+                .cloned()
+                .unwrap_or_else(|| "https://arb1.arbitrum.io/rpc".to_string());
+            let pool = pool.clone();
+            tokio::spawn(async move { escrow::run_escrow_sync_loop(tap, rpc, pool).await });
+        }
+    } else {
+        info!("TAP disabled — probes will keep dispatching through the gateway, so success rate stays an upper bound");
     }
 
     // QoS rollup — Foghorn's OWN observations into the oracle's schema, so the QoS surface
