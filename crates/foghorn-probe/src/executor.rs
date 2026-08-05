@@ -545,3 +545,148 @@ fn extract_meta(value: &serde_json::Value) -> (Option<i64>, Option<String>) {
         None => (None, None),
     }
 }
+
+// ── Paid direct dispatch ──────────────────────────────────────────────────────
+
+/// Everything a paid probe needs beyond the query itself.
+pub struct PaidProbeRequest {
+    pub indexer_address: String,
+    pub indexer_url: String,
+    pub allocation_id: String,
+    pub deployment_ipfs_hash: String,
+    pub query: String,
+    pub block_hash: String,
+    pub stake_weight: f64,
+}
+
+/// Probe one indexer directly, paying for it with a TAP receipt.
+///
+/// This is the difference between a measurement and an upper bound. Gateway-dispatched probes are
+/// routed to indexers the gateway already believes are healthy, so the failures it avoids are
+/// invisible to us and the resulting success rate flatters the network. Here we choose the indexer.
+///
+/// Payment failures are recorded with their own `error_class` rather than as ordinary errors,
+/// because they say nothing about the indexer's health: `payment_denylisted` means their agent has
+/// not observed our escrow deposit yet, and `payment_refused` means we cannot pay at all. Counting
+/// either as a failed query would blame an operator for our own funding.
+pub async fn execute_paid_probe(
+    client: &tap_query::PaidQueryClient,
+    req: PaidProbeRequest,
+) -> RawObservation {
+    let indexer: tap_query::Address = match req.indexer_address.parse() {
+        Ok(a) => a,
+        Err(_) => return error_observation(req.indexer_address, req.stake_weight, None, "bad_indexer_address"),
+    };
+    let allocation: tap_query::Address = match req.allocation_id.parse() {
+        Ok(a) => a,
+        Err(_) => return error_observation(req.indexer_address, req.stake_weight, None, "bad_allocation_id"),
+    };
+
+    let body = serde_json::json!({
+        "query": req.query,
+        "variables": { "block": { "hash": req.block_hash } }
+    })
+    .to_string();
+
+    let resp = match client
+        .query(
+            &req.indexer_url,
+            indexer,
+            allocation,
+            &req.deployment_ipfs_hash,
+            &body,
+            0, // value comes from the client's configured receipt value
+        )
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(indexer = %req.indexer_address, error = %e, "Paid probe transport error");
+            return error_observation(req.indexer_address, req.stake_weight, None, "network_error");
+        }
+    };
+
+    let latency = resp.latency_ms as i32;
+
+    // Distinguish "we could not pay" from "the indexer is unhealthy". Both are non-200 and
+    // conflating them would let our own escrow state masquerade as an operator's failure.
+    if resp.status == 402 {
+        return error_observation(req.indexer_address, req.stake_weight, Some(latency), "payment_refused");
+    }
+    if resp.status == 400 && resp.body.to_lowercase().contains("denylist") {
+        return error_observation(req.indexer_address, req.stake_weight, Some(latency), "payment_denylisted");
+    }
+    if resp.status != 200 {
+        return RawObservation {
+            indexer_address: req.indexer_address,
+            response_hash: None,
+            raw_response: None,
+            latency_ms: latency,
+            meta_block_number: None,
+            meta_block_hash: None,
+            http_status: Some(resp.status as i32),
+            error_class: Some("http_error".to_string()),
+            stake_weight: req.stake_weight,
+        };
+    }
+
+    // A paid response wraps the payload alongside a signed attestation. The GraphQL body is a
+    // string field, so it is parsed out before hashing — hashing the envelope would make every
+    // indexer look divergent, since attestations differ per indexer by construction.
+    let (payload, attestation_present) = match serde_json::from_str::<serde_json::Value>(&resp.body) {
+        Ok(v) => {
+            let inner = v
+                .get("graphQLResponse")
+                .and_then(|s| s.as_str())
+                .map(str::to_string);
+            let att = v.get("attestation").is_some();
+            (inner.unwrap_or(resp.body.clone()), att)
+        }
+        Err(_) => (resp.body.clone(), false),
+    };
+    if !attestation_present {
+        debug!(indexer = %req.indexer_address, "paid response carried no attestation");
+    }
+
+    // Same treatment as the unpaid path: detect GraphQL-level errors, pull _meta, and hash the
+    // JCS-canonicalised body so response clustering can compare indexers against each other.
+    let parsed: Option<serde_json::Value> = serde_json::from_str(&payload).ok();
+    let error_class = parsed
+        .as_ref()
+        .and_then(|v| {
+            v.get("errors")
+                .and_then(|e| e.as_array())
+                .filter(|a| !a.is_empty())
+                .map(|_| "graphql_error".to_string())
+        })
+        .or_else(|| if parsed.is_none() { Some("invalid_json".to_string()) } else { None });
+
+    let (meta_block_number, meta_block_hash) =
+        parsed.as_ref().map(extract_meta).unwrap_or((None, None));
+
+    let response_hash = if error_class.is_none() {
+        normalize_and_hash(&payload).ok()
+    } else {
+        None
+    };
+
+    debug!(
+        indexer = %req.indexer_address,
+        hash = ?response_hash,
+        latency,
+        attested = attestation_present,
+        "Paid probe complete"
+    );
+
+    RawObservation {
+        indexer_address: req.indexer_address,
+        response_hash,
+        raw_response: Some(payload),
+        latency_ms: latency,
+        meta_block_number,
+        meta_block_hash,
+        http_status: Some(200),
+        error_class,
+        stake_weight: req.stake_weight,
+    }
+}
