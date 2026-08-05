@@ -944,17 +944,6 @@ pub async fn graphql_playground() -> axum::response::Html<String> {
 /// Neither feed is canonical. Lodestar publishes what it measures; Edge & Node publish what they
 /// measure; they measure different populations by different means. This endpoint reports the state
 /// of both and ranks neither.
-/// Seconds since the END of the peer's newest published day.
-///
-/// Their `day_number` is a day index, so day N covers `[N*86400, (N+1)*86400)`. Measuring from the
-/// day's start would report a feed that published an hour ago as a day old; measuring from its end
-/// reports zero until that day is actually over, which is the honest reading of "their newest data
-/// runs to here".
-fn now_secs_of_day_after(day_number: i32) -> i64 {
-    let day_end = (day_number as i64 + 1) * 86_400;
-    (chrono::Utc::now().timestamp() - day_end).max(0)
-}
-
 pub async fn qos_status(State(state): State<AppState>) -> Result<Json<Value>, StatusCode> {
     // The oracle's age is when its PUBLISHER last posted to the DataEdge on Gnosis — NOT
     // `max(allocation_qos.updated_at)`, which this endpoint originally used and which records
@@ -986,12 +975,18 @@ pub async fn qos_status(State(state): State<AppState>) -> Result<Json<Value>, St
     // How old the peer's newest DATA is — a different question from when its publisher last posted,
     // and the one that caught a 35-day hole. Read from `day_number` (their day index) rather than
     // our `updated_at`, which only says when we last re-fetched the same stale rows.
-    let peer_newest_day: Option<i32> =
-        sqlx::query_scalar("SELECT max(day_number) FROM allocation_qos")
+    // `day_start` is the peer's OWN timestamp for that day, stored at ingest. `day_number` is their
+    // private day index and shares no epoch with unix time — deriving a date from it reported a
+    // 35-day-old feed as 51 years old.
+    let (peer_newest_day, peer_newest_day_start): (Option<i32>, Option<i64>) =
+        sqlx::query_as("SELECT max(day_number), max(day_start) FROM allocation_qos")
             .fetch_one(&state.pool)
             .await
-            .unwrap_or(None);
-    let peer_data_age_seconds = peer_newest_day.map(|d| now_secs_of_day_after(d));
+            .unwrap_or((None, None));
+    // Age from the END of their newest day: a feed that published an hour ago is not a day stale.
+    let peer_data_age_seconds = peer_newest_day_start
+        .filter(|d| *d > 0)
+        .map(|d| (chrono::Utc::now().timestamp() - (d + 86_400)).max(0));
 
     // Whether the deployment we read is actually accepting the publisher's messages. A subgraph can
     // sit at chain tip, report no indexing errors, and reject every post with "not a valid
@@ -1061,6 +1056,7 @@ pub async fn qos_status(State(state): State<AppState>) -> Result<Json<Value>, St
                 // Lodestar does not mirror or serve this feed.
                 "data": {
                     "newest_day_number": peer_newest_day,
+                    "newest_day_start": peer_newest_day_start,
                     "age_seconds": peer_data_age_seconds,
                 },
                 "subgraph": peer_subgraph.map(|(block, errs, msg_at, valid, err)| json!({

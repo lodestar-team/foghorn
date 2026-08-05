@@ -94,6 +94,7 @@ async fn ingest_allocation_qos(api_key: &str, pool: &PgPool) -> Result<usize> {
         succ_weighted: f64,
         query_sum: i64,
         latest_day: i64,
+        latest_day_start: i64,
         latest_bb: f64,
     }
     let mut agg: HashMap<(String, String), AllocAgg> = HashMap::new();
@@ -102,7 +103,7 @@ async fn ingest_allocation_qos(api_key: &str, pool: &PgPool) -> Result<usize> {
     for _ in 0..60 {
         let q = json!({
             "query": format!(
-                r#"{{ allocationDailyDataPoints(first: 1000, orderBy: id, orderDirection: asc, where: {{ dayNumber_gte: {min_day}, query_count_gte: "{ALLOC_MIN_QUERIES}", id_gt: "{last_id}" }}) {{ id dayNumber indexer_wallet query_count proportion_indexer_200_responses avg_indexer_blocks_behind subgraphDeployment {{ id }} }} }}"#
+                r#"{{ allocationDailyDataPoints(first: 1000, orderBy: id, orderDirection: asc, where: {{ dayNumber_gte: {min_day}, query_count_gte: "{ALLOC_MIN_QUERIES}", id_gt: "{last_id}" }}) {{ id dayNumber dayStart indexer_wallet query_count proportion_indexer_200_responses avg_indexer_blocks_behind subgraphDeployment {{ id }} }} }}"#
             )
         });
         let v: Value = client.post(&url).json(&q).send().await?.json().await?;
@@ -122,11 +123,17 @@ async fn ingest_allocation_qos(api_key: &str, pool: &PgPool) -> Result<usize> {
             let qc: i64 = r["query_count"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0);
             let sr: f64 = r["proportion_indexer_200_responses"].as_str().and_then(|s| s.parse().ok()).unwrap_or(1.0);
             let bb: f64 = r["avg_indexer_blocks_behind"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+            // Their own timestamp for the day, read rather than derived. `dayNumber` is the
+            // oracle's private day index and shares no epoch with unix time.
+            let day_start: i64 = r["dayStart"].as_str().and_then(|s| s.parse().ok())
+                .or_else(|| r["dayStart"].as_i64())
+                .unwrap_or(0);
             let e = agg.entry((indexer, dep)).or_default();
             e.succ_weighted += sr * qc as f64;
             e.query_sum += qc;
             if day >= e.latest_day {
                 e.latest_day = day;
+                e.latest_day_start = day_start;
                 e.latest_bb = bb;
             }
         }
@@ -148,13 +155,14 @@ async fn ingest_allocation_qos(api_key: &str, pool: &PgPool) -> Result<usize> {
         }
         let sr = a.succ_weighted / a.query_sum as f64;
         sqlx::query(
-            r#"INSERT INTO allocation_qos (indexer_address, deployment_id, day_number, success_rate, blocks_behind, query_count, updated_at)
-               VALUES ($1,$2,$3,$4,$5,$6, NOW())
+            r#"INSERT INTO allocation_qos (indexer_address, deployment_id, day_number, day_start, success_rate, blocks_behind, query_count, updated_at)
+               VALUES ($1,$2,$3,$4,$5,$6,$7, NOW())
                ON CONFLICT (indexer_address, deployment_id) DO UPDATE SET
-                 day_number = EXCLUDED.day_number, success_rate = EXCLUDED.success_rate,
+                 day_number = EXCLUDED.day_number, day_start = EXCLUDED.day_start,
+                 success_rate = EXCLUDED.success_rate,
                  blocks_behind = EXCLUDED.blocks_behind, query_count = EXCLUDED.query_count, updated_at = NOW()"#,
         )
-        .bind(indexer).bind(dep).bind(max_day as i32).bind(sr).bind(a.latest_bb).bind(a.query_sum)
+        .bind(indexer).bind(dep).bind(max_day as i32).bind(a.latest_day_start).bind(sr).bind(a.latest_bb).bind(a.query_sum)
         .execute(pool).await?;
         stored += 1;
     }
