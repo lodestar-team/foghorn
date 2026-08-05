@@ -22,7 +22,7 @@ const DASHBOARD: &str = "https://lodestar-dashboard.com";
 const ALERT_FILTER: &str = "(severity = 'critical' OR kind IN \
     ('behind-deployment','behind-deployments','serving-errors-deployment','behind-chainhead'))";
 
-/// How often the canonical-oracle stall check runs.
+/// How often the Edge & Node oracle stall check runs.
 ///
 /// Deliberately far shorter than `POLL_SECS`. The failure-roster digest is hourly on purpose — it
 /// is a summary and re-posting it often would train people to mute the channel. Oracle liveness is
@@ -31,7 +31,7 @@ const ALERT_FILTER: &str = "(severity = 'critical' OR kind IN \
 /// minutes means a 5-minute check is proportionate.
 const ORACLE_POLL_SECS: u64 = 300;
 
-/// Watch the canonical oracle's publisher, independently of the roster digest's cadence.
+/// Watch Edge & Node's publisher, independently of the roster digest's cadence.
 pub async fn run_oracle_watch_loop(webhook: String, pool: PgPool) {
     info!(interval = ORACLE_POLL_SECS, "Oracle stall watch starting");
     let client = match reqwest::Client::builder().timeout(Duration::from_secs(15)).build() {
@@ -314,7 +314,7 @@ fn build_message_body(header: &str, lines: &[String]) -> String {
 }
 
 
-/// Post when the canonical QoS oracle's publisher stops publishing, and once when it recovers.
+/// Post when Edge & Node's QoS oracle stops publishing, and once when it recovers.
 ///
 /// Thresholds reflect the publisher's real behaviour rather than a guess: it posts every 5 minutes
 /// with a steady ~30-minute lag, so 90 minutes of silence is unambiguous and well clear of routine

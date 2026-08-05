@@ -223,97 +223,33 @@ pub async fn daily_points(pool: &PgPool, f: &DailyFilter) -> sqlx::Result<Vec<Pg
         .await
 }
 
-/// The canonical oracle's own rows, from the mirror.
+/// Which feed a query is asking for.
 ///
-/// Column names are aliased to match [`daily_points`] exactly — `indexer_wallet` becomes
-/// `indexer_address`, `subgraph_deployment_ipfs_hash` becomes `deployment_id` — so every resolver
-/// and renderer works against either source without branching. NUMERIC is cast to double precision
-/// in SQL because sqlx cannot decode NUMERIC without the bigdecimal feature; the cast happens at
-/// read time only, and the stored values keep full precision.
+/// Only one remains. Foghorn used to serve a mirror of Edge & Node's published rows alongside its
+/// own, and `gateway_id` chose between them — with theirs as the default, because they were "the
+/// canonical oracle". Neither of those things is true now: there is no canonical oracle, and
+/// Lodestar does not republish anyone else's numbers. This endpoint serves the Lodestar Oracle.
 ///
-/// Foghorn's additions (`comparable_count`, `divergent_count`, `correctness_rate`) are NULL here:
-/// the canonical oracle counts HTTP 200s and cannot know whether a response was correct. Returning
-/// them as NULL rather than 0 keeps "they never measured this" distinct from "they measured zero".
-pub async fn mirror_daily_points(pool: &PgPool, f: &DailyFilter) -> sqlx::Result<Vec<PgRow>> {
-    let sql = format!(
-        r#"
-        SELECT
-            id,
-            day_number,
-            day_start,
-            day_end,
-            data_point_count,
-            indexer_wallet                            AS indexer_address,
-            indexer_url,
-            subgraph_deployment_ipfs_hash             AS deployment_id,
-            chain_id,
-            -- The mirror's own rows may carry the publisher's gateway_id or none at all; either way
-            -- these are Edge & Node's numbers, so that is what is reported.
-            COALESCE(gateway_id, 'edgeandnode')       AS gateway_id,
-            query_count::bigint                       AS query_count,
-            num_indexer_200_responses::bigint         AS num_indexer_200_responses,
-            proportion_indexer_200_responses::double precision AS proportion_indexer_200_responses,
-            avg_indexer_latency_ms::double precision  AS avg_indexer_latency_ms,
-            max_indexer_latency_ms::double precision  AS max_indexer_latency_ms,
-            avg_indexer_blocks_behind::double precision AS avg_indexer_blocks_behind,
-            max_indexer_blocks_behind::double precision AS max_indexer_blocks_behind,
-            -- Real fees, which the measured feed cannot produce at all until probes are TAP-paid.
-            avg_query_fee::double precision           AS avg_query_fee,
-            max_query_fee::double precision           AS max_query_fee,
-            total_query_fees::double precision        AS total_query_fees,
-            NULL::bigint                              AS comparable_count,
-            NULL::bigint                              AS divergent_count,
-            NULL::double precision                    AS correctness_rate,
-            synced_at                                 AS computed_at
-        FROM oracle_allocation_daily
-        WHERE ($1::text IS NULL OR indexer_wallet = $1)
-          AND ($2::text IS NULL OR subgraph_deployment_ipfs_hash = $2)
-          AND ($3::int  IS NULL OR day_number  = $3)
-          AND ($4::int  IS NULL OR day_number >= $4)
-          AND ($5::int  IS NULL OR day_number <= $5)
-          AND ($6::bigint IS NULL OR query_count >= $6::numeric)
-          AND ($7::text IS NULL OR id > $7)
-        ORDER BY {order}
-        LIMIT $8 OFFSET $9
-        "#,
-        order = f.order.clause(),
-    );
-
-    sqlx::query(&sql)
-        .bind(&f.indexer)
-        .bind(&f.deployment)
-        .bind(f.day_eq)
-        .bind(f.day_gte)
-        .bind(f.day_lte)
-        .bind(f.query_count_gte)
-        .bind(&f.id_gt)
-        .bind(f.limit)
-        .bind(f.skip)
-        .fetch_all(pool)
-        .await
-}
-
-/// Which feed a request wants.
-///
-/// The default is deliberately CANONICAL. A consumer that repoints an existing oracle query at this
-/// endpoint expects the numbers it already had; silently substituting Foghorn's probe measurements
-/// would change the meaning of every field under them — probe counts are not traffic, and our
-/// success rate is a biased upper bound. Ours is opt-in via `gateway_id: "lodestar"`.
+/// The type is kept rather than deleted because `gateway_id` is still a legitimate filter — the
+/// schema carries it precisely so several gateways can publish — and a consumer asking for a
+/// gateway we are not is asking for nothing, which must return empty rather than quietly returning
+/// ours under someone else's name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Feed {
-    /// Mirror of Edge & Node's published data.
-    Canonical,
-    /// Foghorn's own measurements.
+    /// The Lodestar Oracle's own measurements.
     Measured,
+    /// A gateway_id we do not publish for. Serves nothing.
+    Foreign,
 }
 
 impl Feed {
     pub fn from_gateway_id(gateway_id: Option<&str>) -> Self {
         match gateway_id {
+            None => Self::Measured,
             Some(g) if g.eq_ignore_ascii_case("lodestar") || g.eq_ignore_ascii_case("foghorn") => {
                 Self::Measured
             }
-            _ => Self::Canonical,
+            Some(_) => Self::Foreign,
         }
     }
 }
@@ -321,8 +257,8 @@ impl Feed {
 /// Fetch daily points from whichever feed was asked for.
 pub async fn points_for(pool: &PgPool, feed: Feed, f: &DailyFilter) -> sqlx::Result<Vec<PgRow>> {
     match feed {
-        Feed::Canonical => mirror_daily_points(pool, f).await,
         Feed::Measured => daily_points(pool, f).await,
+        Feed::Foreign => Ok(Vec::new()),
     }
 }
 

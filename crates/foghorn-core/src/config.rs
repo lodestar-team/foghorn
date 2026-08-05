@@ -244,44 +244,34 @@ impl Default for DataEdgeConfig {
     }
 }
 
-/// Mirroring the canonical QoS oracle's subgraph in full.
+/// Watching Edge & Node's oracle as a peer.
 ///
-/// The oracle's own subgraph is the only surviving source for its historical metrics: they cannot be
-/// recomputed (private gateway telemetry) and cannot be fetched from the chain (the DataEdge carries
-/// only CIDs, and those payloads are unreachable from public IPFS). Reaching it needs the gateway,
-/// hence `[gateway].api_key`.
+/// Foghorn no longer mirrors it. Two independent oracles publish QoS for this network — theirs and
+/// the Lodestar Oracle — and neither is canonical over the other, so republishing their numbers
+/// under our name bought a dependency on their pipeline and nothing else. Their data is still read,
+/// for one purpose: comparing our measurements against a second opinion.
+///
+/// This config drives only the freshness check on the feed we compare against. Reaching it needs
+/// the gateway, hence `[gateway].api_key`.
 #[derive(Debug, Deserialize, Clone)]
 #[serde(default)]
-pub struct OracleMirrorConfig {
+pub struct PeerOracleConfig {
     pub enabled: bool,
     pub interval_secs: u64,
+    /// The deployment whose freshness we report — and, via `ingest.rs`, whose numbers we compare
+    /// against. Keep the two in step: reporting one deployment's health while comparing against
+    /// another's data would be worse than reporting nothing.
     pub subgraph_id: String,
-    pub gateway_base: String,
-    /// Trailing days of daily entities to re-pull each cycle. The newest days are still being
-    /// written, so a one-shot sync would freeze partial values forever.
-    pub window_days: u32,
-    /// Window for the 5-minute `AllocationDataPoint` entity, in HOURS. One row per indexer ×
-    /// deployment × 288 buckets a day means a day-granular window is millions of rows, far past any
-    /// page budget, so this is deliberately the smallest unit that makes sense.
-    pub point_window_hours: u32,
-    /// Keyset pages per entity per cycle. Hitting this cap is logged as INCOMPLETE rather than
-    /// passing silently for complete.
-    pub max_pages: u32,
-    pub timeout_secs: u64,
 }
 
-impl Default for OracleMirrorConfig {
+impl Default for PeerOracleConfig {
     fn default() -> Self {
         Self {
             enabled: true,
             interval_secs: 900,
-            // The live Gateway QoS Oracle subgraph, same id ingest.rs already reads.
-            subgraph_id: "Dtr9rETvwokot4BSXaD5tECanXfqfJKcvHuaaEgPDD2D".to_string(),
-            gateway_base: "https://gateway-arbitrum.network.thegraph.com/api".to_string(),
-            window_days: 7,
-            point_window_hours: 24,
-            max_pages: 40,
-            timeout_secs: 30,
+            // Must match `ingest.rs`'s QOS_ORACLE_ID — see the note there on why this is the fork
+            // rather than the deployment usually called canonical.
+            subgraph_id: "CnfJ5tC5cfAmt2tUyUaM6vPrtmNYasavkDDn793FkbN3".to_string(),
         }
     }
 }
@@ -370,7 +360,7 @@ pub struct FoghornConfig {
     pub status_probe: StatusProbeConfig,
     pub qos_rollup: QosRollupConfig,
     pub data_edge: DataEdgeConfig,
-    pub oracle_mirror: OracleMirrorConfig,
+    pub peer_oracle: PeerOracleConfig,
     pub tap: TapConfig,
     /// Discord webhook URL for #foghorn-alerts. When set, new critical
     /// needs-attention items are pushed to Discord. Empty = alerting disabled.
@@ -407,7 +397,7 @@ impl Default for FoghornConfig {
             status_probe: StatusProbeConfig::default(),
             qos_rollup: QosRollupConfig::default(),
             data_edge: DataEdgeConfig::default(),
-            oracle_mirror: OracleMirrorConfig::default(),
+            peer_oracle: PeerOracleConfig::default(),
             tap: TapConfig::default(),
             alert_webhook: None,
         }

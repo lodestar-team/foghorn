@@ -18,7 +18,15 @@ const QOS_WINDOW_DAYS: usize = 30;
 const QOS_CONCURRENCY: usize = 6;
 
 // QoS oracle (Edge & Node) — per-allocation (indexer × deployment) daily metrics.
-const QOS_ORACLE_ID: &str = "Dtr9rETvwokot4BSXaD5tECanXfqfJKcvHuaaEgPDD2D";
+/// Edge & Node's QoS oracle, read for comparison only — never republished.
+///
+/// This is the ellipfra fork, and the choice is deliberate. The deployment usually called
+/// "canonical" (`Dtr9rETvwokot4BSXaD5tECanXfqfJKcvHuaaEgPDD2D`) stopped accepting the publisher's
+/// messages on 2026-07-01 — its allowlist does not carry the signer they rotated to — and has
+/// served 1 July data ever since, at chain tip, reporting no indexing errors. Comparing today's
+/// measurements against that would manufacture disagreement out of nothing but the calendar.
+/// This fork carries an updated allowlist and is current.
+const QOS_ORACLE_ID: &str = "CnfJ5tC5cfAmt2tUyUaM6vPrtmNYasavkDDn793FkbN3";
 const QOS_ORACLE_BASE: &str = "https://gateway-arbitrum.network.thegraph.com/api";
 const ALLOC_MIN_QUERIES: i64 = 10; // ignore only near-zero-traffic allocations (per day)
 // Trailing window (oracle days) the per-allocation QoS is aggregated over. The

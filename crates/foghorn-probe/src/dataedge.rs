@@ -1,4 +1,4 @@
-//! The canonical oracle's publisher liveness, read from Gnosis.
+//! Edge & Node's publisher liveness, read from Gnosis.
 //!
 //! Foghorn's view of the Edge & Node QoS oracle used to come entirely through its subgraph, which
 //! means every freshness figure was really a measure of *our own ingest clock*. With the oracle 37
@@ -17,9 +17,10 @@
 //! means availability decays: a payload is retrievable near publication and stops being so later.
 //!
 //! So each newly-seen message gets one immediate fetch attempt. When it succeeds the raw bytes are
-//! ours, independent of anyone's subgraph continuing to exist. When it fails nothing is lost — the
-//! subgraph mirror still carries the parsed metrics. Attempts are made once per message, never
-//! retried in a later cycle, because a CID that was not served within minutes will not appear later.
+//! ours, independent of anyone's subgraph continuing to exist. When it fails we lose only Edge &
+//! Node's copy of that bucket, which was never ours to serve anyway. Attempts are made once per
+//! message, never retried in a later cycle, because a CID not served within minutes will not appear
+//! later.
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, TimeZone, Utc};
@@ -61,7 +62,7 @@ pub async fn run_dataedge_loop(cfg: DataEdgeConfig, pool: PgPool) {
     info!(
         address = %cfg.address,
         interval = cfg.interval_secs,
-        "DataEdge poller starting (canonical oracle publisher liveness)"
+        "DataEdge poller starting (Edge & Node publisher liveness)"
     );
     loop {
         match poll_once(&cfg, &pool).await {

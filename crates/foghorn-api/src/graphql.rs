@@ -1,7 +1,7 @@
 //! GraphQL compatibility with the Gateway QoS Oracle subgraph.
 //!
 //! The point of this module is that an existing consumer changes a URL and nothing else. It
-//! mirrors the entity and field names of the reference oracle subgraph
+//! reuses the entity and field names of Edge & Node's oracle subgraph
 //! (`juanmardefago/gateway-qos-oracle-example-subgraph`), and it exists because the two
 //! consumers that matter query in incompatible shapes:
 //!
@@ -106,7 +106,7 @@ pub struct AllocationDailyDataPointFilter {
     #[graphql(name = "subgraph_deployment_ipfs_hash")]
     pub subgraph_deployment_ipfs_hash: Option<String>,
     /// Selects the feed. Absent or anything other than "lodestar"/"foghorn" returns the CANONICAL
-    /// oracle data from Lodestar's mirror — a consumer repointing an existing query must get the
+    /// Edge & Node's rows — a consumer repointing an existing query must get the
     /// numbers it already had, not our probe measurements under the same field names.
     #[graphql(name = "gateway_id")]
     pub gateway_id: Option<String>,
@@ -228,7 +228,7 @@ impl AllocationDailyDataPoint {
         big(self.0.get("max_indexer_blocks_behind"))
     }
 
-    // Fees are REAL on the canonical feed (the mirror carries the publisher's own figures) and
+    // Fees are real on Edge & Node's feed (they see what users actually paid) and
     // absent on the measured feed until probes are TAP-paid. `try_get` covers both without
     // branching: a column the measured query does not select resolves to null, which correctly
     // means "not measured" rather than "free".
@@ -311,7 +311,7 @@ impl SubgraphDeployment {
         r#where: Option<AllocationDailyDataPointFilter>,
     ) -> async_graphql::Result<Vec<AllocationDailyDataPoint>> {
         let mut f = DailyFilter::for_deployment(&self.id);
-        let feed = r#where.as_ref().map(|w| w.feed()).unwrap_or(Feed::Canonical);
+        let feed = r#where.as_ref().map(|w| w.feed()).unwrap_or(Feed::Measured);
         if let Some(w) = r#where {
             w.apply(&mut f);
         }
@@ -346,7 +346,7 @@ impl Indexer {
         r#where: Option<AllocationDailyDataPointFilter>,
     ) -> async_graphql::Result<Vec<AllocationDailyDataPoint>> {
         let mut f = DailyFilter::for_indexer(&self.id);
-        let feed = r#where.as_ref().map(|w| w.feed()).unwrap_or(Feed::Canonical);
+        let feed = r#where.as_ref().map(|w| w.feed()).unwrap_or(Feed::Measured);
         if let Some(w) = r#where {
             w.apply(&mut f);
         }
@@ -438,7 +438,7 @@ impl QueryRoot {
         r#where: Option<AllocationDailyDataPointFilter>,
     ) -> async_graphql::Result<Vec<AllocationDailyDataPoint>> {
         let mut f = DailyFilter::default();
-        let feed = r#where.as_ref().map(|w| w.feed()).unwrap_or(Feed::Canonical);
+        let feed = r#where.as_ref().map(|w| w.feed()).unwrap_or(Feed::Measured);
         if let Some(w) = r#where {
             w.apply(&mut f);
         }
@@ -457,7 +457,7 @@ impl QueryRoot {
         r#where: Option<AllocationDailyDataPointFilter>,
     ) -> async_graphql::Result<Vec<QueryDailyDataPoint>> {
         let mut f = DailyFilter::default();
-        let feed = r#where.as_ref().map(|w| w.feed()).unwrap_or(Feed::Canonical);
+        let feed = r#where.as_ref().map(|w| w.feed()).unwrap_or(Feed::Measured);
         if let Some(w) = r#where {
             w.apply(&mut f);
         }

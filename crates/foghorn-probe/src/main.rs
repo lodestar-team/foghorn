@@ -14,7 +14,7 @@ mod escrow;
 mod executor;
 mod ingest;
 mod lodestar;
-mod mirror;
+mod peer;
 mod qos;
 mod resolver;
 mod scheduler;
@@ -56,15 +56,16 @@ async fn main() -> anyhow::Result<()> {
         tokio::spawn(async move { status::run_status_loop(status_cfg, pool).await });
     }
 
-    // Full mirror of the canonical oracle. This is the clone: every number it ever published,
-    // held by Lodestar, served in its own schema, queryable without an API key. It cannot invent
-    // data for a window the publisher never produced — but the history stays served and the freeze
-    // stays visible.
-    {
-        let mirror_cfg = config.oracle_mirror.clone();
+    // Edge & Node's oracle, watched as a peer. We no longer hold or serve a copy of it: there is no
+    // canonical oracle, only two independent ones, and republishing theirs made Lodestar a
+    // dependency of their pipeline for nothing. What this loop reports is whether the feed we
+    // compare ourselves against is current — a subgraph at chain tip with no indexing errors can
+    // still be rejecting every message, which is exactly what happened on 2026-07-01.
+    if config.peer_oracle.enabled {
+        let peer_cfg = config.peer_oracle.clone();
         let api_key = config.gateway.as_ref().map(|g| g.api_key.clone());
         let pool = pool.clone();
-        tokio::spawn(async move { mirror::run_mirror_loop(mirror_cfg, api_key, pool).await });
+        tokio::spawn(async move { peer::run_peer_watch_loop(peer_cfg, api_key, pool).await });
     }
 
     // Canonical oracle publisher liveness, straight from Gnosis. No API key, no subgraph, so
