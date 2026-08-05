@@ -58,6 +58,10 @@ pub struct ScoringConfig {
     pub w_availability: f64,
     pub w_freshness: f64,
     pub w_coverage: f64,
+    /// Dead. `value` scored query volume from the canonical oracle — a demand signal probing
+    /// cannot reproduce, from a feed that can be silently stale. Kept so existing config files
+    /// still parse; changing it has no effect.
+    #[deprecated(note = "value was removed from the composite; this weight is ignored")]
     pub w_value: f64,
     // Grade thresholds on the 0..100 composite.
     pub grade_a: f64,
@@ -84,11 +88,15 @@ impl Default for ScoringConfig {
         Self {
             windows: vec![7, 30],
             interval_secs: 900,
-            w_correctness: 0.35,
-            w_availability: 0.25,
+            // Renormalised over the four components we can actually measure, preserving their
+            // relative emphasis after `value` (0.10) was removed. Correctness leads because it is
+            // the one signal no gateway telemetry can produce at all.
+            w_correctness: 0.40,
+            w_availability: 0.30,
             w_freshness: 0.20,
             w_coverage: 0.10,
-            w_value: 0.10,
+            #[allow(deprecated)]
+            w_value: 0.0,
             grade_a: 90.0,
             grade_b: 75.0,
             grade_c: 60.0,

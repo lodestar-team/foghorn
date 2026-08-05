@@ -60,6 +60,7 @@ pub async fn run_score_once(cfg: &ScoringConfig, api_key: Option<&str>, pool: &P
 
     let profiles = load_profiles(pool).await?;
     let alloc_health = load_alloc_health(pool).await?;
+    let measured_lag = load_measured_lag(pool).await?;
     let recent = load_probe_agg(pool, "6 hours").await?;
 
     let mut windows = cfg.windows.clone();
@@ -78,7 +79,7 @@ pub async fn run_score_once(cfg: &ScoringConfig, api_key: Option<&str>, pool: &P
         keys.extend(agg.keys());
 
         for addr in keys {
-            let inputs = assemble(addr, *window, &agg, &recent, &profiles, &alloc_health, &sybil_map);
+            let inputs = assemble(addr, *window, &agg, &recent, &profiles, &alloc_health, &sybil_map, &measured_lag);
             let outcome = judge(&inputs, cfg);
             upsert_score(pool, &outcome.score).await?;
             scored += 1;
@@ -124,6 +125,9 @@ fn assemble(
     profiles: &HashMap<String, Profile>,
     alloc_health: &HashMap<String, (i64, i64)>,
     sybil_map: &HashMap<String, (String, f64)>,
+    // Chainhead lag Foghorn measured itself. Separate from `profiles`, which carries the canonical
+    // oracle's figures, so the two provenances cannot be mixed up at the call site.
+    measured_lag: &HashMap<String, f64>,
 ) -> ScoreInputs {
     let a = agg.get(addr).cloned().unwrap_or_default();
     let r = recent.get(addr).cloned().unwrap_or_default();
@@ -149,6 +153,7 @@ fn assemble(
         allocation_count: p.allocation_count,
         qos_success_rate: p.qos_success_rate,
         qos_blocks_behind: p.qos_blocks_behind,
+        measured_blocks_behind: measured_lag.get(addr).copied(),
         qos_query_count: p.qos_query_count,
         reo_status: p.reo_status,
         ens_name: p.ens_name,
@@ -560,4 +565,29 @@ async fn upsert_attention(pool: &PgPool, a: &AttentionItem) -> Result<()> {
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/// Chainhead lag Foghorn measured itself, per indexer, over the recent window.
+///
+/// Read from `foghorn_qos` rather than `indexer_profile.qos_blocks_behind`, which carries the
+/// canonical oracle's number. That distinction is the whole point: the oracle's figure was frozen
+/// at 2026-07-01 for over a month while reporting itself healthy, so a freshness score built on it
+/// was scoring month-old state and could not tell.
+async fn load_measured_lag(pool: &PgPool) -> Result<HashMap<String, f64>> {
+    let rows = sqlx::query(
+        r#"SELECT indexer_address, avg(avg_indexer_blocks_behind) AS lag
+           FROM foghorn_qos
+           WHERE bucket_start >= NOW() - interval '24 hours'
+             AND avg_indexer_blocks_behind IS NOT NULL
+           GROUP BY 1"#,
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|r| {
+            let addr: String = r.get("indexer_address");
+            r.get::<Option<f64>, _>("lag").map(|l| (addr, l))
+        })
+        .collect())
 }

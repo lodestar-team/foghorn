@@ -37,6 +37,10 @@ pub struct ScoreInputs {
     pub allocation_count: Option<i32>,
     pub qos_success_rate: Option<f64>, // 0..100
     pub qos_blocks_behind: Option<f64>,
+    /// Chainhead lag Foghorn measured itself, from `foghorn_qos`. Preferred over
+    /// `qos_blocks_behind` (the canonical oracle's figure) because that feed can be — and on
+    /// 2026-07-01 was — a month stale while looking perfectly healthy.
+    pub measured_blocks_behind: Option<f64>,
     pub qos_query_count: Option<i64>,
     pub reo_status: Option<String>,
     pub ens_name: Option<String>,
@@ -130,9 +134,10 @@ fn availability_score(i: &ScoreInputs, cfg: &ScoringConfig) -> Option<f64> {
         let err_rate = i.error_observations as f64 / i.total_observations as f64;
         parts.push(100.0 * (1.0 - clamp01(err_rate)));
     }
-    if let Some(q) = i.qos_success_rate {
-        parts.push(q.max(0.0).min(100.0));
-    }
+    // The canonical oracle's success rate is deliberately NOT mixed in here any more. It measures
+    // a different population (real gateway traffic) on a different clock, and when it goes stale it
+    // does so invisibly — averaging it with live observations produced a score that was part
+    // measurement and part month-old memory, with no way to tell which.
     // Per-deployment serving health — surfaces broad failure the query-weighted
     // mean hides (an indexer can be 99% by volume yet erroring on half its subgraphs).
     if let Some(broken) = serving_broken_fraction(i, cfg) {
@@ -152,9 +157,12 @@ fn lag_to_score(lag: f64, behind_blocks: i64) -> f64 {
 }
 
 fn freshness_score(i: &ScoreInputs, cfg: &ScoringConfig) -> Option<f64> {
-    // Driven by the QoS oracle's measured blocks-behind (query-derived, reliable),
-    // not /status latestBlock (nonsensical for syncing / cross-chain deployments).
-    let bb = i.qos_blocks_behind?;
+    // Our own measurement first, the canonical oracle only as a fallback. The oracle's figure was
+    // the sole input until it emerged that its subgraph had published nothing for 34 days while
+    // reporting itself healthy — a score built on it was silently scoring month-old state.
+    //
+    // Still not /status latestBlock, which is nonsensical for syncing or cross-chain deployments.
+    let bb = i.measured_blocks_behind.or(i.qos_blocks_behind)?;
     Some(lag_to_score(bb.max(0.0), cfg.behind_lag_blocks))
 }
 
@@ -165,18 +173,6 @@ fn coverage_score(i: &ScoreInputs, cfg: &ScoringConfig) -> Option<f64> {
     Some(100.0 * clamp01(count / target))
 }
 
-fn value_score(i: &ScoreInputs, cfg: &ScoringConfig) -> Option<f64> {
-    let queries = i.qos_query_count?;
-    // A heavily-staked indexer serving almost nothing is a leech: zero value.
-    if let Some(stake) = i.self_stake_grt {
-        if stake >= cfg.leech_min_stake_grt && queries <= cfg.leech_max_queries {
-            return Some(0.0);
-        }
-    }
-    // Otherwise reward query volume on a log curve (10k queries ≈ full marks).
-    let reference = 10_000.0_f64.ln_1p();
-    Some(100.0 * clamp01((queries.max(0) as f64).ln_1p() / reference))
-}
 
 /// Is there enough signal to actually judge this indexer? An indexer with no
 /// query volume, no allocations, and no Foghorn probe coverage is *inactive*,
@@ -220,15 +216,19 @@ pub fn judge(i: &ScoreInputs, cfg: &ScoringConfig) -> ScoreOutcome {
     let availability = availability_score(i, cfg);
     let freshness = freshness_score(i, cfg);
     let coverage = coverage_score(i, cfg);
-    let value = value_score(i, cfg);
 
-    // Weighted mean over present sub-scores.
-    let weighted: [(Option<f64>, f64); 5] = [
+    // `value` used to sit here, scoring query volume from the canonical oracle. It is gone: query
+    // volume is DEMAND, a fact about which indexers a gateway chose to route to, and no amount of
+    // probing reproduces it. Scoring an operator on a number we cannot measure — and which was in
+    // practice a month stale — was rewarding or punishing them for our blind spot.
+    //
+    // Weighted mean over present sub-scores. Weights are renormalised by the denominator, so a
+    // missing sub-score reduces the divisor rather than counting as zero.
+    let weighted: [(Option<f64>, f64); 4] = [
         (correctness, cfg.w_correctness),
         (availability, cfg.w_availability),
         (freshness, cfg.w_freshness),
         (coverage, cfg.w_coverage),
-        (value, cfg.w_value),
     ];
     let mut num = 0.0;
     let mut den = 0.0;
@@ -260,13 +260,15 @@ pub fn judge(i: &ScoreInputs, cfg: &ScoringConfig) -> ScoreOutcome {
     }
     let grade = grade_for(composite, cfg).to_string();
 
-    let reasons = build_reasons(i, cfg, correctness, availability, freshness, coverage, value);
+    let reasons = build_reasons(i, cfg, correctness, availability, freshness, coverage);
     let sub_scores = json!({
         "correctness": correctness,
         "availability": availability,
         "freshness": freshness,
         "coverage": coverage,
-        "value": value,
+        // Retained as an explicit null so consumers can tell the component was dropped rather
+        // than silently omitted.
+        "value": serde_json::Value::Null,
     });
 
     let score = IndexerScore {
@@ -279,7 +281,9 @@ pub fn judge(i: &ScoreInputs, cfg: &ScoringConfig) -> ScoreOutcome {
         availability_score: availability,
         freshness_score: freshness,
         coverage_score: coverage,
-        value_score: value,
+        // Always None now. The column and the API field remain so consumers see an explicit
+        // "not measured" rather than a field that silently disappeared.
+        value_score: None,
         sybil_flag,
         sybil_cluster_id: if sybil_flag {
             i.sybil_cluster_id.clone()
@@ -305,7 +309,6 @@ fn build_reasons(
     availability: Option<f64>,
     _freshness: Option<f64>,
     coverage: Option<f64>,
-    value: Option<f64>,
 ) -> Vec<String> {
     let mut r = Vec::new();
     if let Some(_c) = correctness {
@@ -357,13 +360,10 @@ fn build_reasons(
             ));
         }
     }
-    if value == Some(0.0) {
-        r.push(format!(
-            "high stake ({:.0} GRT) but only {} queries served — leech",
-            i.self_stake_grt.unwrap_or(0.0),
-            i.qos_query_count.unwrap_or(0)
-        ));
-    }
+    // The "leech" reason lived here: high stake, few queries served. It is gone from the score
+    // because it is a judgement about DEMAND — how much traffic a gateway chose to send — which
+    // probing cannot measure and which came from a feed that can be silently a month stale.
+    // Accusing an operator of leeching on that basis is not a claim this score can support.
     if i.ens_name.is_none() {
         r.push("anonymous (no ENS name)".to_string());
     }
@@ -672,7 +672,12 @@ mod tests {
         i.self_stake_grt = Some(100_000_000.0); // 100M, the swarm pattern
         i.qos_query_count = Some(5);
         let out = judge(&i, &cfg());
-        assert_eq!(out.score.value_score, Some(0.0));
+        // The `value` sub-score is gone: query volume is demand, which probing cannot measure and
+        // which came from a feed that can be silently a month stale. It stays in the response as an
+        // explicit null so consumers can see it was dropped rather than omitted.
+        assert_eq!(out.score.value_score, None);
+        // The leech VERDICT still fires. It reads the canonical query count directly rather than
+        // via the composite, and is a separate judgement with its own thresholds.
         assert!(out.verdicts.iter().any(|v| v.kind == "leech"));
         // eligible + leech => should be flagged as REO-ineligible candidate
         assert!(out.verdicts.iter().any(|v| v.kind == "reo-ineligible-candidate"));
