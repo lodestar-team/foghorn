@@ -1,5 +1,8 @@
 # ── Build stage ────────────────────────────────────────────────────────────────
-FROM rust:1-slim AS builder
+# Pinned to bookworm to match the runtime stages below. `rust:1-slim` floats, and when it moved to
+# trixie the binaries started linking GLIBC_2.38 against a bookworm runtime with 2.36 — a build that
+# succeeds and then dies on exec, which docker reports as a restart loop rather than a build failure.
+FROM rust:1-slim-bookworm AS builder
 
 RUN apt-get update && apt-get install -y pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
 

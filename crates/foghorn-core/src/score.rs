@@ -46,6 +46,8 @@ pub struct ScoreInputs {
     pub self_stake_grt: Option<f64>,
     pub allocation_count: Option<i32>,
     pub qos_success_rate: Option<f64>, // 0..100
+    /// The canonical oracle's chainhead lag. Carried for display and comparison ONLY; no sub-score,
+    /// verdict or attention item reads it. See `freshness_score` and `is_behind`.
     pub qos_blocks_behind: Option<f64>,
     /// Chainhead lag Foghorn measured itself, from `foghorn_qos`. Preferred over
     /// `qos_blocks_behind` (the canonical oracle's figure) because that feed can be — and on
@@ -167,12 +169,14 @@ fn lag_to_score(lag: f64, behind_blocks: i64) -> f64 {
 }
 
 fn freshness_score(i: &ScoreInputs, cfg: &ScoringConfig) -> Option<f64> {
-    // Our own measurement first, the canonical oracle only as a fallback. The oracle's figure was
-    // the sole input until it emerged that its subgraph had published nothing for 34 days while
-    // reporting itself healthy — a score built on it was silently scoring month-old state.
+    // Our own measurement, or nothing. The canonical oracle's `qos_blocks_behind` used to serve as
+    // a fallback, which sounds harmless and is not: an indexer we have never probed then scored on
+    // a chainhead lag last written on 2026-07-01, and the resulting grade was indistinguishable
+    // from one earned this hour. Returning None costs that indexer its freshness component and
+    // says so, which is the honest answer to "how far behind are they?" when we have not looked.
     //
     // Still not /status latestBlock, which is nonsensical for syncing or cross-chain deployments.
-    let bb = i.measured_blocks_behind.or(i.qos_blocks_behind)?;
+    let bb = i.measured_blocks_behind?;
     Some(lag_to_score(bb.max(0.0), cfg.behind_lag_blocks))
 }
 
@@ -184,15 +188,46 @@ fn coverage_score(i: &ScoreInputs, cfg: &ScoringConfig) -> Option<f64> {
 }
 
 
-/// Is there enough signal to actually judge this indexer? An indexer with no
-/// query volume, no allocations, and no Foghorn probe coverage is *inactive*,
-/// not *bad* — grading it F-0 would conflate "doing nothing" with "doing harm".
-/// A high-stake idle indexer is the exception: that's a leech, and is rated.
+/// Is there enough signal to actually judge this indexer?
+///
+/// Two separate questions live here, and conflating them was a bug. *Active* — does this operator
+/// do anything at all — is answered by allocations or query volume. *Judgeable* — have we measured
+/// anything about the quality of what they do — needs at least one of correctness, availability or
+/// freshness, all of which come from our own probes.
+///
+/// Coverage alone is not a judgement. It counts allocations: how many subgraphs an indexer signed
+/// up to serve, not whether any of them are served correctly, quickly or at all. Rating on coverage
+/// alone handed a flat A-100 to fifteen indexers we had never once probed, on a page whose whole
+/// claim is that it shows measurements — the same failure as reading an absent number as a healthy
+/// one, arrived at from the opposite direction.
+///
+/// An indexer that is active but unmeasured comes back NR: not damning, just honest.
+/// A high-stake idle indexer is the exception: that's a leech, and is rated on that basis alone.
 fn is_rated(i: &ScoreInputs, cfg: &ScoringConfig) -> bool {
-    i.qos_query_count.map(|q| q > 0).unwrap_or(false)
-        || i.probes_answered > 0
-        || i.allocation_count.map(|n| n > 0).unwrap_or(false)
-        || is_leech(i, cfg)
+    if is_leech(i, cfg) {
+        return true;
+    }
+    let active = i.probes_answered > 0
+        || i.qos_query_count.map(|q| q > 0).unwrap_or(false)
+        || i.allocation_count.map(|n| n > 0).unwrap_or(false);
+    let measured = correctness_score(i).is_some()
+        || availability_score(i, cfg).is_some()
+        || freshness_score(i, cfg).is_some();
+    active && measured
+}
+
+/// Why an indexer came back NR. "Idle" and "unmeasured" are opposite problems and the operator
+/// reading this needs to know which one applies to them.
+fn unrated_reason(i: &ScoreInputs, cfg: &ScoringConfig) -> String {
+    let active = i.probes_answered > 0
+        || i.qos_query_count.map(|q| q > 0).unwrap_or(false)
+        || i.allocation_count.map(|n| n > 0).unwrap_or(false);
+    if active {
+        let _ = cfg;
+        "not rated — active, but Lodestar has not measured this indexer in the window".to_string()
+    } else {
+        "inactive — no queries, allocations, or probe coverage".to_string()
+    }
 }
 
 /// Compute the full judgement for one (indexer, window). Pure.
@@ -213,7 +248,7 @@ pub fn judge(i: &ScoreInputs, cfg: &ScoringConfig) -> ScoreOutcome {
             sybil_flag: false,
             sybil_cluster_id: None,
             probe_count: 0,
-            reasons: vec!["inactive — no queries, allocations, or probe coverage".to_string()],
+            reasons: vec![unrated_reason(i, cfg)],
             sub_scores: json!({
                 "correctness": null, "availability": null, "freshness": null,
                 "coverage": null, "value": null
@@ -342,9 +377,9 @@ fn build_reasons(
             i.error_observations, i.total_observations
         ));
     }
-    if let Some(bb) = i.qos_blocks_behind {
+    if let Some(bb) = i.measured_blocks_behind {
         if bb > cfg.behind_lag_blocks as f64 {
-            r.push(format!("behind chainhead (~{:.0} blocks, QoS)", bb));
+            r.push(format!("behind chainhead (~{:.0} blocks, measured)", bb));
         }
     }
     if qos_failing(i, cfg) {
@@ -424,8 +459,14 @@ fn is_serving_no_data(i: &ScoreInputs, cfg: &ScoringConfig) -> bool {
         || (i.recent_observations >= 3 && recent_error_rate(i) >= cfg.no_data_min_error_rate)
 }
 
+/// Behind chainhead, on our own reading.
+///
+/// This fires a High verdict and a needs-attention item that names the operator on a public
+/// dashboard. It ran on `qos_blocks_behind` — the canonical oracle's figure — until that feed
+/// stopped publishing on 2026-07-01 and kept serving its last values as though they were current.
+/// An accusation is only as fresh as its evidence, so the evidence is now ours or there is none.
 fn is_behind(i: &ScoreInputs, cfg: &ScoringConfig) -> bool {
-    i.qos_blocks_behind.map(|b| b > cfg.behind_lag_blocks as f64).unwrap_or(false)
+    i.measured_blocks_behind.map(|b| b > cfg.behind_lag_blocks as f64).unwrap_or(false)
 }
 
 fn is_leech(i: &ScoreInputs, cfg: &ScoringConfig) -> bool {
@@ -486,7 +527,7 @@ fn derive_verdicts(i: &ScoreInputs, cfg: &ScoringConfig, composite: f64) -> Vec<
             "behind-chainhead",
             Severity::High,
             "Behind chainhead".to_string(),
-            json!({ "qos_blocks_behind": i.qos_blocks_behind }),
+            json!({ "measured_blocks_behind": i.measured_blocks_behind }),
         ));
     }
 
@@ -583,7 +624,7 @@ fn derive_attention(i: &ScoreInputs, cfg: &ScoringConfig) -> Vec<AttentionItem> 
     }
 
     if is_behind(i, cfg) {
-        let lag = i.qos_blocks_behind.unwrap_or(0.0).max(0.0);
+        let lag = i.measured_blocks_behind.unwrap_or(0.0).max(0.0);
         a.push(AttentionItem {
             indexer_address: i.indexer_address.clone(),
             kind: "behind-chainhead".to_string(),
@@ -591,7 +632,7 @@ fn derive_attention(i: &ScoreInputs, cfg: &ScoringConfig) -> Vec<AttentionItem> 
             severity: Severity::High,
             urgency: 50.0 + lag.min(1000.0) / 20.0,
             title: format!("Behind chainhead (~{:.0} blocks)", lag),
-            detail: json!({ "qos_blocks_behind": i.qos_blocks_behind }),
+            detail: json!({ "measured_blocks_behind": i.measured_blocks_behind }),
         });
     }
 
@@ -704,7 +745,7 @@ mod tests {
     #[test]
     fn behind_chainhead_attention() {
         let mut i = healthy();
-        i.qos_blocks_behind = Some(1_600_000.0); // egregiously stuck (> 500k threshold)
+        i.measured_blocks_behind = Some(1_600_000.0); // egregiously stuck (> 500k threshold)
         let out = judge(&i, &cfg());
         assert!(out.verdicts.iter().any(|v| v.kind == "behind-chainhead"));
         assert!(out.attention.iter().any(|a| a.kind == "behind-chainhead"));
@@ -714,7 +755,7 @@ mod tests {
     #[test]
     fn moderate_lag_does_not_flag_behind() {
         let mut i = healthy();
-        i.qos_blocks_behind = Some(6_000.0); // fast-chain noise, not stuck
+        i.measured_blocks_behind = Some(6_000.0); // fast-chain noise, not stuck
         let out = judge(&i, &cfg());
         assert!(!out.verdicts.iter().any(|v| v.kind == "behind-chainhead"));
     }
@@ -747,13 +788,50 @@ mod tests {
         assert!(out.verdicts.iter().any(|v| v.kind == "leech"));
     }
 
+    /// An indexer we have never measured must not be graded on its allocation count alone.
+    ///
+    /// This asserted the opposite until 2026-08-05, and the live consequence was fifteen indexers
+    /// carrying a flat A-100 on the public board whose sole basis was "has allocations" — no probe
+    /// ever sent, no response ever seen. Coverage says what an operator signed up to serve, never
+    /// whether they serve it.
     #[test]
-    fn no_probe_coverage_still_grades_on_other_signals() {
+    fn coverage_alone_is_not_a_grade() {
         let mut i = healthy();
         i.probes_answered = 0;
         i.total_observations = 0;
+        i.qos_deployments_measured = 0;
+        i.qos_deployments_erroring = 0;
+        i.measured_blocks_behind = None;
         let out = judge(&i, &cfg());
-        assert!(out.score.correctness_score.is_none());
+        assert!(!out.score.rated, "unmeasured indexer must not be rated");
+        assert_eq!(out.score.grade, "NR");
+        assert!(out.verdicts.is_empty());
+        assert!(out.score.reasons[0].contains("not measured"), "{:?}", out.score.reasons);
+    }
+
+    /// The canonical oracle's chainhead figure must not resurrect a grade on its own.
+    #[test]
+    fn stale_oracle_lag_does_not_stand_in_for_measurement() {
+        let mut i = healthy();
+        i.probes_answered = 0;
+        i.total_observations = 0;
+        i.qos_deployments_measured = 0;
+        i.qos_deployments_erroring = 0;
+        i.measured_blocks_behind = None;
+        i.qos_blocks_behind = Some(1.0); // pristine, and a month old
+        let out = judge(&i, &cfg());
+        assert!(out.score.freshness_score.is_none());
+        assert!(!out.score.rated);
+    }
+
+    /// Probe coverage without a freshness reading still grades — on what was measured.
+    #[test]
+    fn partial_measurement_still_grades() {
+        let mut i = healthy();
+        i.measured_blocks_behind = None;
+        let out = judge(&i, &cfg());
+        assert!(out.score.rated);
+        assert!(out.score.freshness_score.is_none());
         assert!(out.score.composite > 0.0);
     }
 
