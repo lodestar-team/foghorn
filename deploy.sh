@@ -16,7 +16,9 @@ SSH_KEY="$HOME/.ssh/hetzner_drpc"
 REMOTE_DIR="/root/foghorn"
 
 echo "==> Syncing source to VPS..."
-rsync -avz --exclude target --exclude .git --exclude node_modules --exclude config.toml \
+# .env is excluded for the same reason as config.toml, and a stronger one: it holds the TAP signer
+# key, which spends escrow. It lives only on the box.
+rsync -avz --exclude target --exclude .git --exclude node_modules --exclude config.toml --exclude .env \
   -e "ssh -i $SSH_KEY" \
   "$(dirname "$0")/" "$VPS:$REMOTE_DIR/"
 

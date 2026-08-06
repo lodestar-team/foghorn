@@ -28,6 +28,11 @@ services:
     environment:
       FOGHORN__DATABASE_URL: "postgres://foghorn:foghorn@db:5432/foghorn"
       RUST_LOG: "foghorn_probe=info,reqwest=warn"
+      # Signs TAP receipts. Read from the host environment (see .env, gitignored, 0600) rather than
+      # config.toml so the key is never in a file that gets rsynced, committed or pasted into a
+      # terminal. It authorises spending from the payer's escrow, so leaking it means losing the
+      # escrow — not the queries.
+      FOGHORN__TAP__SIGNER_KEY: "${FOGHORN_TAP_SIGNER_KEY:-}"
     volumes:
       - ./config.toml:/app/config.toml:ro
       - ./test-sets:/app/test-sets:ro

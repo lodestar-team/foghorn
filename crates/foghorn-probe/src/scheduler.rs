@@ -2,6 +2,7 @@ use crate::{
     cluster::{compute_clusters, ClusterInput},
     discovery::{get_opted_in_indexers, get_safe_block},
     executor::{
+        DISPATCH_PAID,
         execute_gateway_probe, execute_paid_probe, execute_probe, GatewayProbeRequest,
         PaidProbeRequest, ProbeRequest, RawObservation,
     },
@@ -173,7 +174,24 @@ async fn run_probe_round(
                     Vec::new()
                 };
 
-                let raw_observations = if let (Some((client, _)), false) =
+                // Paid dispatch is ADDITIVE, never a replacement.
+                //
+                // It used to be exclusive: any deployment with a payable target was probed only
+                // through paid dispatch. That looks right until you count what actually comes back.
+                // Escrow propagation is slow and one-sided — an indexer's tap-agent must observe our
+                // deposit before it stops denylisting us — and at the time of writing 15 of 17
+                // funded indexers still refuse. Exclusive mode would therefore have swapped ~8
+                // gateway observations per probe for 2 paid ones: less coverage, and far less
+                // correctness signal, since clustering needs several indexers answering the
+                // IDENTICAL probe and a majority of at least two before it will call anyone wrong.
+                //
+                // Running both against the same `probe_id` is strictly better than either alone.
+                // Paid observations are unbiased (we choose the indexer); gateway observations are
+                // broad but selection-biased (it routes to indexers it already trusts). Each is
+                // tagged with how it was dispatched so neither claim has to be made about the other.
+                let mut raw_observations: Vec<RawObservation> = Vec::new();
+
+                if let (Some((client, _)), false) =
                     (paid_client.as_ref(), paid_targets.is_empty())
                 {
                     let mut obs = Vec::new();
@@ -193,8 +211,10 @@ async fn run_probe_round(
                             tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                         }
                     }
-                    obs
-                } else if let Some(gw) = &config.gateway {
+                    raw_observations.extend(obs);
+                }
+
+                let fallback_observations = if let Some(gw) = &config.gateway {
                     // Gateway mode: fire probe_count queries, each may come from a different indexer
                     let subgraph_id = test_set
                         .deployment
@@ -247,6 +267,7 @@ async fn run_probe_round(
                     }
                     obs
                 };
+                raw_observations.extend(fallback_observations);
 
                 // Deduplicate by indexer_address — only keep one observation per address
                 // (same allocation key = same indexer allocation)
@@ -296,11 +317,41 @@ async fn run_probe_round(
 }
 
 /// Deduplicate observations: same indexer_address = same allocation, keep first.
+/// One observation per indexer, keeping the most informative one.
+///
+/// This was first-wins, which was fine while every observation came from a single dispatch mode.
+/// Once paid and gateway probes run against the same `probe_id`, first-wins becomes a silent data
+/// loss: paid observations are pushed first, so a `payment_denylisted` — which is not an observation
+/// of the indexer at all, only of our escrow — would evict a perfectly good gateway response from
+/// the same operator. We would then have measured nothing and not noticed.
+///
+/// Rank: a real response beats any error; a genuine error (timeout, 500, bad data) beats a payment
+/// refusal, because it at least describes the indexer.
 fn dedup_by_address(obs: Vec<RawObservation>) -> Vec<RawObservation> {
-    let mut seen = std::collections::HashSet::new();
-    obs.into_iter()
-        .filter(|o| seen.insert(o.indexer_address.clone()))
-        .collect()
+    fn rank(o: &RawObservation) -> u8 {
+        if o.response_hash.is_some() {
+            2
+        } else if !is_payment_error(o.error_class.as_deref()) {
+            1
+        } else {
+            0
+        }
+    }
+
+    let mut best: Vec<RawObservation> = Vec::new();
+    for o in obs {
+        match best.iter().position(|b| b.indexer_address == o.indexer_address) {
+            Some(i) if rank(&o) > rank(&best[i]) => best[i] = o,
+            Some(_) => {}
+            None => best.push(o),
+        }
+    }
+    best
+}
+
+/// A refusal to accept our payment, as opposed to anything the indexer did wrong.
+pub fn is_payment_error(error_class: Option<&str>) -> bool {
+    matches!(error_class, Some(e) if e.starts_with("payment_"))
 }
 
 fn parse_stake_weight(stake_grt: Option<&str>) -> f64 {
@@ -341,8 +392,8 @@ async fn store_results(
 
     for obs in observations {
         sqlx::query(
-            "INSERT INTO observation (probe_id, indexer_address, response_hash, latency_ms, meta_block_number, meta_block_hash, http_status, error_class, stake_weight)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            "INSERT INTO observation (probe_id, indexer_address, response_hash, latency_ms, meta_block_number, meta_block_hash, http_status, error_class, stake_weight, dispatch_mode)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
              ON CONFLICT (probe_id, indexer_address) DO NOTHING",
         )
         .bind(probe_id)
@@ -354,6 +405,7 @@ async fn store_results(
         .bind(obs.http_status)
         .bind(&obs.error_class)
         .bind(obs.stake_weight)
+        .bind(&obs.dispatch_mode)
         .execute(pool)
         .await?;
     }
@@ -439,4 +491,78 @@ fn build_paid_client(
     // we want per query" knob.
     let max_targets = config.gateway.as_ref().map(|g| g.probe_count as usize).unwrap_or(8);
     Ok((client, max_targets))
+}
+
+#[cfg(test)]
+mod dedup_tests {
+    use super::*;
+
+    fn obs(addr: &str, hash: Option<&str>, err: Option<&str>) -> RawObservation {
+        RawObservation {
+            indexer_address: addr.to_string(),
+            response_hash: hash.map(str::to_string),
+            raw_response: None,
+            latency_ms: 10,
+            meta_block_number: None,
+            meta_block_hash: None,
+            http_status: hash.map(|_| 200),
+            error_class: err.map(str::to_string),
+            stake_weight: 1.0,
+            dispatch_mode: DISPATCH_PAID.to_string(),
+        }
+    }
+
+    /// The regression that made paid dispatch safe to enable.
+    ///
+    /// Paid observations are collected first, so under the old first-wins rule a denylisted payment
+    /// evicted a real gateway response from the same indexer — we would have thrown away the only
+    /// measurement we had and recorded nothing.
+    #[test]
+    fn a_payment_refusal_never_evicts_a_real_response() {
+        let deduped = dedup_by_address(vec![
+            obs("0xa", None, Some("payment_denylisted")),
+            obs("0xa", Some("hash"), None),
+        ]);
+        assert_eq!(deduped.len(), 1);
+        assert_eq!(deduped[0].response_hash.as_deref(), Some("hash"));
+    }
+
+    /// A genuine fault still beats a payment refusal: it describes the indexer, which is the point.
+    #[test]
+    fn a_real_error_beats_a_payment_refusal() {
+        let deduped = dedup_by_address(vec![
+            obs("0xa", None, Some("payment_refused")),
+            obs("0xa", None, Some("timeout")),
+        ]);
+        assert_eq!(deduped[0].error_class.as_deref(), Some("timeout"));
+    }
+
+    /// And a payment refusal is still kept when it is all we have — dropping it silently would hide
+    /// that we tried and could not pay.
+    #[test]
+    fn a_lone_payment_refusal_is_kept() {
+        let deduped = dedup_by_address(vec![obs("0xa", None, Some("payment_denylisted"))]);
+        assert_eq!(deduped.len(), 1);
+        assert_eq!(deduped[0].error_class.as_deref(), Some("payment_denylisted"));
+    }
+
+    #[test]
+    fn distinct_indexers_are_all_kept() {
+        let deduped = dedup_by_address(vec![
+            obs("0xa", Some("h1"), None),
+            obs("0xb", Some("h2"), None),
+            obs("0xa", Some("h3"), None),
+        ]);
+        assert_eq!(deduped.len(), 2);
+        // First real response wins for a given address; later duplicates do not overwrite it.
+        assert_eq!(deduped[0].response_hash.as_deref(), Some("h1"));
+    }
+
+    #[test]
+    fn payment_errors_are_recognised_by_prefix() {
+        assert!(is_payment_error(Some("payment_denylisted")));
+        assert!(is_payment_error(Some("payment_refused")));
+        assert!(!is_payment_error(Some("timeout")));
+        assert!(!is_payment_error(None));
+    }
 }

@@ -1036,8 +1036,38 @@ pub async fn qos_status(State(state): State<AppState>) -> Result<Json<Value>, St
         t.map(|t| (now - t).num_seconds()).map(Value::from).unwrap_or(Value::Null)
     };
 
+    // Paid dispatch, reported as a fact about US.
+    //
+    // Payment refusals are excluded from the feed and the grades, because they describe our escrow
+    // rather than an indexer. Excluded is not the same as hidden: dropping them without saying so
+    // would leave a reader unable to tell "we measure 40 indexers directly" from "we tried and 38
+    // turned our money away", which are very different claims about how good this oracle is.
+    let (paid_ok, paid_denied, paid_refused): (i64, i64, i64) = sqlx::query_as(
+        r#"SELECT
+               COUNT(*) FILTER (WHERE o.error_class IS NULL AND o.response_hash IS NOT NULL)::bigint,
+               COUNT(*) FILTER (WHERE o.error_class = 'payment_denylisted')::bigint,
+               COUNT(*) FILTER (WHERE o.error_class = 'payment_refused')::bigint
+           FROM observation o
+           JOIN probe p ON p.id = o.probe_id
+           WHERE p.dispatched_at >= NOW() - interval '24 hours'
+             AND (o.error_class LIKE 'payment\_%' OR o.dispatch_mode = 'paid')"#,
+    )
+    .fetch_one(&state.pool)
+    .await
+    .unwrap_or((0, 0, 0));
+
     Ok(Json(json!({
         "checked_at": now.to_rfc3339(),
+        "paid_dispatch": {
+            "window_hours": 24,
+            "served": paid_ok,
+            "refused_denylisted": paid_denied,
+            "refused_unfunded": paid_refused,
+            "note": "Direct-to-indexer probes, paid with TAP receipts, where WE choose who answers \
+                     rather than a gateway choosing for us. Refusals are OUR problem — an indexer's \
+                     tap-agent has not yet observed our escrow deposit — and are excluded from every \
+                     measurement and grade rather than counted against the operator.",
+        },
         "sources": [
             {
                 "source": "edgeandnode-qos-oracle",

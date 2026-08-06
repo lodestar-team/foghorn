@@ -68,7 +68,21 @@ pub struct RawObservation {
     pub http_status: Option<i32>,
     pub error_class: Option<String>,
     pub stake_weight: f64,
+    /// How this observation was obtained: `"paid"` (direct, TAP receipt, we chose the indexer) or
+    /// `"gateway"` (routed by Edge & Node's gateway, which chooses for us).
+    ///
+    /// Not cosmetic. Gateway observations are selection-biased — the gateway avoids indexers it
+    /// believes are unhealthy, so the failures it dodges never reach us and any success rate built
+    /// from them is an upper bound. Paid observations carry no such bias. Mixing the two without
+    /// recording which is which would force the page into one claim about bias that is true of some
+    /// rows and false of others.
+    pub dispatch_mode: String,
 }
+
+/// Dispatched directly by us, paid with a TAP receipt. Unbiased: we chose the indexer.
+pub const DISPATCH_PAID: &str = "paid";
+/// Routed by the gateway, which selects the indexer. Broad, but selection-biased.
+pub const DISPATCH_GATEWAY: &str = "gateway";
 
 /// Execute a probe via The Graph gateway. The response hash is taken from
 /// the `graph-attestation` header (`responseCID`), and the indexer address
@@ -129,6 +143,7 @@ pub async fn execute_gateway_probe(req: GatewayProbeRequest) -> RawObservation {
             http_status: Some(http_status),
             error_class: Some("http_error".to_string()),
             stake_weight: 1.0,
+            dispatch_mode: DISPATCH_GATEWAY.to_string(),
         };
     }
 
@@ -184,6 +199,7 @@ pub async fn execute_gateway_probe(req: GatewayProbeRequest) -> RawObservation {
         http_status: Some(http_status),
         error_class,
         stake_weight: 1.0,
+        dispatch_mode: DISPATCH_GATEWAY.to_string(),
     }
 }
 
@@ -301,6 +317,7 @@ pub async fn execute_probe(req: ProbeRequest) -> RawObservation {
             http_status: Some(http_status),
             error_class: Some("http_error".to_string()),
             stake_weight: req.stake_weight,
+            dispatch_mode: DISPATCH_PAID.to_string(),
         };
     }
 
@@ -317,6 +334,7 @@ pub async fn execute_probe(req: ProbeRequest) -> RawObservation {
                 http_status: Some(http_status),
                 error_class: Some("body_error".to_string()),
                 stake_weight: req.stake_weight,
+                dispatch_mode: DISPATCH_PAID.to_string(),
             };
         }
         Ok(t) => t,
@@ -362,6 +380,7 @@ pub async fn execute_probe(req: ProbeRequest) -> RawObservation {
         http_status: Some(http_status),
         error_class,
         stake_weight: req.stake_weight,
+        dispatch_mode: DISPATCH_PAID.to_string(),
     }
 }
 
@@ -376,6 +395,7 @@ fn gateway_error_observation(class: &str) -> RawObservation {
         http_status: None,
         error_class: Some(class.to_string()),
         stake_weight: 1.0,
+        dispatch_mode: DISPATCH_GATEWAY.to_string(),
     }
 }
 
@@ -390,6 +410,7 @@ fn error_observation(addr: String, stake_weight: f64, latency_ms: Option<i32>, c
         http_status: None,
         error_class: Some(class.to_string()),
         stake_weight,
+        dispatch_mode: DISPATCH_PAID.to_string(),
     }
 }
 
@@ -627,6 +648,7 @@ pub async fn execute_paid_probe(
             http_status: Some(resp.status as i32),
             error_class: Some("http_error".to_string()),
             stake_weight: req.stake_weight,
+            dispatch_mode: DISPATCH_PAID.to_string(),
         };
     }
 
@@ -688,5 +710,6 @@ pub async fn execute_paid_probe(
         http_status: Some(200),
         error_class,
         stake_weight: req.stake_weight,
+        dispatch_mode: DISPATCH_PAID.to_string(),
     }
 }

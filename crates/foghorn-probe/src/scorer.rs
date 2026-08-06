@@ -198,6 +198,11 @@ async fn load_probe_agg(pool: &PgPool, interval: &str) -> Result<HashMap<String,
            JOIN allocation_map am ON am.allocation_key = o.indexer_address
                 AND am.indexer_address IS NOT NULL
            WHERE p.dispatched_at > NOW() - $1::interval
+             -- Payment refusals describe our escrow, not the operator. Left in, they would drive
+             -- the availability sub-score — and therefore the public grade — straight down for
+             -- every indexer whose tap-agent has not yet seen our deposit. See qos.rs for the full
+             -- reasoning; the two must agree or the grade and the feed would tell different stories.
+             AND (o.error_class IS NULL OR o.error_class NOT LIKE 'payment\_%')
            GROUP BY am.indexer_address"#,
     )
     .bind(interval)

@@ -2,3 +2,6 @@ target/
 config.toml
 *.env
 .env.local
+
+# Holds FOGHORN_TAP_SIGNER_KEY — signs TAP receipts, spends escrow.
+.env
