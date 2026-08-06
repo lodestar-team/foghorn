@@ -23,10 +23,30 @@ const PAGE: i64 = 5_000;
 pub async fn run_fee_ingest_loop(nest: NestClient, interval_secs: u64, pool: PgPool) {
     info!(interval = interval_secs, "Chain query-fee ingest starting");
     loop {
-        match ingest_once(&nest, &pool).await {
-            Ok(0) => {}
-            Ok(n) => info!(rows = n, "Chain query fees ingested"),
-            Err(e) => warn!(error = %e, "Chain query-fee ingest failed"),
+        // Drain the backlog before sleeping.
+        //
+        // This used to do exactly one page per interval, which is fine once caught up and absurd
+        // before: 63k settlements at 5k per five minutes is an hour of walking history, during
+        // which the page's 30-day window stays empty and the fees section simply does not render.
+        // A full page means there is more behind it, so keep going; a short page means we have
+        // reached the end and can idle.
+        let mut drained = 0usize;
+        loop {
+            match ingest_once(&nest, &pool).await {
+                Ok(n) => {
+                    drained += n;
+                    if (n as i64) < PAGE {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, "Chain query-fee ingest failed");
+                    break;
+                }
+            }
+        }
+        if drained > 0 {
+            info!(rows = drained, "Chain query fees ingested");
         }
         tokio::time::sleep(Duration::from_secs(interval_secs)).await;
     }
