@@ -208,7 +208,11 @@ async fn load_probe_agg(pool: &PgPool, interval: &str) -> Result<HashMap<String,
              -- every indexer whose tap-agent has not yet seen our deposit. See qos.rs for the full
              -- reasoning; the two must agree or the grade and the feed would tell different stories.
              AND (o.error_class IS NULL OR o.error_class NOT LIKE 'payment\_%')
-           GROUP BY am.indexer_address"#,
+           -- Group by the resolved identity, not by am.indexer_address alone. A paid observation
+           -- has no allocation_map row, so its identity comes from o.indexer_address via the
+           -- COALESCE above - and grouping by only one half of that is a Postgres error, which took
+           -- the whole scoring cycle down and quietly froze every grade on the public board.
+           GROUP BY COALESCE(am.indexer_address, o.indexer_address)"#,
     )
     .bind(interval)
     .fetch_all(pool)
