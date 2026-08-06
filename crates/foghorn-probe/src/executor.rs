@@ -637,6 +637,21 @@ pub async fn execute_paid_probe(
     if resp.status == 400 && resp.body.to_lowercase().contains("denylist") {
         return error_observation(req.indexer_address, req.stake_weight, Some(latency), "payment_denylisted");
     }
+    // Any other 4xx on a PAID probe is logged with its body.
+    //
+    // A paid probe has more ways to fail than an ordinary one, and most of them are our fault:
+    // a receipt below the indexer's cost model, an allocation that just closed, a data-service
+    // mismatch. Those must not be recorded as the indexer serving badly, and the only way to tell
+    // them apart is to read what the indexer actually said. Truncated because an error body can
+    // carry a full GraphQL response.
+    if (400..500).contains(&resp.status) {
+        tracing::warn!(
+            indexer = %req.indexer_address,
+            status = resp.status,
+            body = %resp.body.chars().take(300).collect::<String>(),
+            "paid probe refused with a 4xx — check whether this is us or them"
+        );
+    }
     if resp.status != 200 {
         return RawObservation {
             indexer_address: req.indexer_address,
