@@ -45,6 +45,16 @@ pub async fn run_allocation_sync_loop(
         // checkable claim rather than an assumption.
         let mut done = false;
         if let Some(client) = nest.as_ref() {
+            // Give the chain-tip reader a moment on the first pass. It is spawned alongside this
+            // loop, so without this the very first sync races it, finds no tip, and falls back to
+            // the gateway - meaning every restart spent a full sync interval on the dependency we
+            // are trying to shed, for no reason but startup ordering.
+            for _ in 0..10 {
+                if chain_tip().is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
             match chain_tip() {
                 Some(tip) => match sync_from_nest(client, tip, &pool).await {
                     Ok(n) => {
