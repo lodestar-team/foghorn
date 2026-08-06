@@ -633,8 +633,34 @@ pub async fn execute_paid_probe(
     if resp.status == 402 {
         return error_observation(req.indexer_address, req.stake_weight, Some(latency), "payment_refused");
     }
-    if resp.status == 400 && resp.body.to_lowercase().contains("denylist") {
-        return error_observation(req.indexer_address, req.stake_weight, Some(latency), "payment_denylisted");
+    if resp.status == 400 {
+        let body = resp.body.to_lowercase();
+        if body.contains("denylist") {
+            return error_observation(
+                req.indexer_address,
+                req.stake_weight,
+                Some(latency),
+                "payment_denylisted",
+            );
+        }
+        // Every other way the receipt itself can be rejected. Matched on the phrase indexer-rs uses
+        // for the whole family rather than on each specific check, because the specific ones are
+        // theirs to change and the consequence of missing one is severe: an underpriced or
+        // malformed receipt is OUR fault, and classifying it as an indexer fault publishes a
+        // failure against an operator who did nothing wrong.
+        //
+        // That is not hypothetical. Receipts went out with value 0 for one deploy; the two indexers
+        // whose tap-agents had accepted us refused them with "does not have the minimum value", and
+        // 55 observations were recorded as `http_error` — dragging down the availability of the only
+        // two operators actually serving us.
+        if body.contains("issues with provided receipt") || body.contains("receipt error") {
+            return error_observation(
+                req.indexer_address,
+                req.stake_weight,
+                Some(latency),
+                "payment_refused",
+            );
+        }
     }
     // Any other 4xx on a PAID probe is logged with its body.
     //
