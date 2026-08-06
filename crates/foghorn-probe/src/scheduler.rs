@@ -485,7 +485,12 @@ fn build_paid_client(
         data_service: config.tap.data_service.parse()?,
         payer: config.tap.payer.parse()?,
     };
-    let client = tap_query::PaidQueryClient::new(signer, ctx, Duration::from_secs(30))?;
+    let client = tap_query::PaidQueryClient::new(
+        signer,
+        ctx,
+        Duration::from_secs(30),
+        config.tap.receipt_value,
+    )?;
     // Cap targets per deployment so one very widely-allocated subgraph cannot consume a whole
     // round's budget. Reuses the gateway's probe_count, which is already the "how many opinions do
     // we want per query" knob.

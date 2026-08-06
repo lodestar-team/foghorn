@@ -616,7 +616,6 @@ pub async fn execute_paid_probe(
             allocation,
             &req.deployment_ipfs_hash,
             &body,
-            0, // value comes from the client's configured receipt value
         )
         .await
     {
