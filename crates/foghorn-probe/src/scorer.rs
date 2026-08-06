@@ -237,7 +237,10 @@ async fn detect_nondeterministic(pool: &PgPool) -> Result<()> {
                   COUNT(DISTINCT p.id)::int AS total,
                   COUNT(DISTINCT d.probe_id)::int AS divergent
            FROM probe p
-           LEFT JOIN divergence d ON d.probe_id = p.id
+           -- `cluster_count > 1` is what makes a row a DISAGREEMENT. Rows are now written for
+           -- every corroborated probe, including ones where all indexers matched, so a bare
+           -- existence check here would mark every well-corroborated deployment non-deterministic.
+           LEFT JOIN divergence d ON d.probe_id = p.id AND d.cluster_count > 1
            WHERE p.dispatched_at > NOW() - INTERVAL '7 days'
            GROUP BY p.deployment_id
            HAVING COUNT(DISTINCT d.probe_id) >= 3
@@ -451,7 +454,8 @@ async fn sample_divergent_fields(pool: &PgPool, deployment_id: &str) -> Result<V
            FROM divergence d
            JOIN probe p ON p.id = d.probe_id
            CROSS JOIN LATERAL jsonb_array_elements(d.diff_patches) elem
-           WHERE p.deployment_id = $1
+           WHERE d.cluster_count > 1
+             AND p.deployment_id = $1
              AND p.dispatched_at > NOW() - INTERVAL '7 days'
            LIMIT 12"#,
     )

@@ -410,7 +410,20 @@ async fn store_results(
         .await?;
     }
 
-    if clusters.is_divergent && !clusters.largest_by_count_hash.is_empty() {
+    // Record the cluster result for EVERY corroborated probe, not only the ones that disagreed.
+    //
+    // This was `if clusters.is_divergent`, and the consequence was that agreement — the common case,
+    // and the one an operator actually wants evidenced — was never written down. `comparable_count`
+    // in the rollup counts responses that have a cluster row, so with no row for agreement it read
+    // 13 against 325 probes that genuinely had two or more indexers answering. `correctness_rate`
+    // was therefore NULL for every indexer that always agreed, and non-null only for those already
+    // caught in a divergence: a correctness metric that could say "this indexer was in a
+    // disagreement" but never "this indexer has been checked and matched, 300 times".
+    //
+    // The row is now written whenever at least two indexers answered the identical probe, which is
+    // exactly the condition under which the comparison means anything. `cluster_count = 1` is a
+    // perfectly good finding: everyone agreed.
+    if clusters.largest_by_count_size >= 2 && !clusters.largest_by_count_hash.is_empty() {
         sqlx::query(
             "INSERT INTO divergence (probe_id, cluster_count, diff_patches, largest_by_count_hash, largest_by_count_size, largest_by_stake_hash, largest_by_stake_weight, created_at)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8)

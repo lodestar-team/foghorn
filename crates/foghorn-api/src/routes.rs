@@ -27,7 +27,7 @@ pub async fn stats(State(state): State<AppState>) -> Result<Json<Value>, StatusC
         .map(|r| r.get::<i64, _>(0))
         .unwrap_or(0);
 
-    let total_divergences: i64 = sqlx::query("SELECT COUNT(*) FROM divergence")
+    let total_divergences: i64 = sqlx::query("SELECT COUNT(*) FROM divergence WHERE cluster_count > 1")
         .fetch_one(db)
         .await
         .map(|r| r.get::<i64, _>(0))
@@ -55,7 +55,7 @@ pub async fn stats(State(state): State<AppState>) -> Result<Json<Value>, StatusC
             .unwrap_or(0);
 
     let divergences_24h: i64 = sqlx::query(
-        "SELECT COUNT(*) FROM divergence WHERE created_at > NOW() - INTERVAL '24 hours'",
+        "SELECT COUNT(*) FROM divergence WHERE cluster_count > 1 AND created_at > NOW() - INTERVAL '24 hours'",
     )
     .fetch_one(db)
     .await
@@ -105,7 +105,10 @@ pub async fn feed(
                FROM divergence d
                JOIN probe p ON p.id = d.probe_id
                LEFT JOIN observation o ON o.probe_id = p.id
-               WHERE p.deployment_id = $1
+               -- Only actual disagreements. A row exists for every corroborated probe now,
+               -- including unanimous ones, and this feed names indexers publicly.
+               WHERE d.cluster_count > 1
+                 AND p.deployment_id = $1
                GROUP BY p.id, p.deployment_id, p.block_number, p.block_hash,
                         p.query_category, p.dispatched_at, d.cluster_count, d.diff_patches, d.created_at
                ORDER BY d.created_at DESC
@@ -124,6 +127,8 @@ pub async fn feed(
                FROM divergence d
                JOIN probe p ON p.id = d.probe_id
                LEFT JOIN observation o ON o.probe_id = p.id
+               -- Only actual disagreements; see the filtered variant above.
+               WHERE d.cluster_count > 1
                GROUP BY p.id, p.deployment_id, p.block_number, p.block_hash,
                         p.query_category, p.dispatched_at, d.cluster_count, d.diff_patches, d.created_at
                ORDER BY d.created_at DESC
@@ -254,7 +259,7 @@ pub async fn indexer_quality(
     let summary = sqlx::query(
         r#"SELECT
              COUNT(DISTINCT o.probe_id) as total_probes,
-             COUNT(DISTINCT CASE WHEN d.probe_id IS NOT NULL THEN o.probe_id END) as divergent_probes,
+             COUNT(DISTINCT CASE WHEN d.cluster_count > 1 THEN o.probe_id END) as divergent_probes,
              ROUND(AVG(o.latency_ms))::int as avg_latency_ms,
              PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY o.latency_ms) as p50_latency,
              PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY o.latency_ms) as p95_latency
@@ -275,7 +280,7 @@ pub async fn indexer_quality(
         r#"SELECT
              p.deployment_id,
              COUNT(DISTINCT o.probe_id) as total_probes,
-             COUNT(DISTINCT CASE WHEN d.probe_id IS NOT NULL THEN o.probe_id END) as divergent_probes
+             COUNT(DISTINCT CASE WHEN d.cluster_count > 1 THEN o.probe_id END) as divergent_probes
            FROM observation o
            JOIN probe p ON p.id = o.probe_id
            LEFT JOIN divergence d ON d.probe_id = o.probe_id
@@ -435,7 +440,7 @@ pub async fn deployment_quality(
              am.indexer_address as resolved_indexer,
              am.indexer_url,
              COUNT(DISTINCT o.probe_id) as total_probes,
-             COUNT(DISTINCT CASE WHEN d.probe_id IS NOT NULL THEN o.probe_id END) as divergent_probes,
+             COUNT(DISTINCT CASE WHEN d.cluster_count > 1 THEN o.probe_id END) as divergent_probes,
              ROUND(AVG(o.latency_ms))::int as avg_latency_ms,
              MAX(p.dispatched_at) as last_seen
            FROM observation o
