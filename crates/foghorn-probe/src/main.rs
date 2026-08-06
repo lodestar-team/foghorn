@@ -2,7 +2,7 @@ use foghorn_core::{
     config::load_config,
     db::{create_pool, run_migrations},
 };
-use tracing::info;
+use tracing::{info, warn};
 
 mod alerter;
 mod allocations;
@@ -13,6 +13,7 @@ mod discovery;
 mod escrow;
 mod executor;
 mod ingest;
+mod nest;
 mod lodestar;
 mod peer;
 mod qos;
@@ -83,7 +84,53 @@ async fn main() -> anyhow::Result<()> {
             let api_key = config.gateway.as_ref().map(|g| g.api_key.clone());
             let secs = config.tap.allocation_sync_secs;
             let pool = pool.clone();
-            tokio::spawn(async move { allocations::run_allocation_sync_loop(api_key, secs, pool).await });
+            // Our own nest over Horizon, when configured. It supplies the allocation set and the
+            // indexer endpoints from Arbitrum directly, which is the last thing paid probing needs
+            // from Edge & Node's gateway.
+            let nest = if config.nest.enabled && !config.nest.url.is_empty() {
+                let auth = match (&config.nest.username, &config.nest.password) {
+                    (Some(u), Some(p)) => Some((u.clone(), p.clone())),
+                    _ => None,
+                };
+                match nest::NestClient::new(&config.nest.url, auth) {
+                    Ok(c) => {
+                        info!(url = %config.nest.url, "Allocation set will be read from our own nest");
+                        Some(c)
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "Nest client could not be built — staying on the gateway");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            // Chain tip, read from the same RPC the escrow sync uses. The nest is only trusted when
+            // it is caught up, and "caught up" is meaningless without an independent tip.
+            let rpc = config
+                .rpc_urls
+                .get("arbitrum-one")
+                .cloned()
+                .unwrap_or_else(|| "https://arb1.arbitrum.io/rpc".to_string());
+            let tip_cache: std::sync::Arc<std::sync::atomic::AtomicU64> =
+                std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+            {
+                let tip_cache = tip_cache.clone();
+                let rpc = rpc.clone();
+                tokio::spawn(async move { allocations::run_chain_tip_loop(rpc, tip_cache).await });
+            }
+            let tip_reader = {
+                let tip_cache = tip_cache.clone();
+                std::sync::Arc::new(move || {
+                    match tip_cache.load(std::sync::atomic::Ordering::Relaxed) {
+                        0 => None,
+                        n => Some(n),
+                    }
+                }) as std::sync::Arc<dyn Fn() -> Option<u64> + Send + Sync>
+            };
+            tokio::spawn(async move {
+                allocations::run_allocation_sync_loop(api_key, secs, nest, tip_reader, pool).await
+            });
         }
         {
             let tap = config.tap.clone();

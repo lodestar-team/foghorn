@@ -336,6 +336,39 @@ impl Default for TapConfig {
     }
 }
 
+/// Our own nuthatch nest over Horizon on Arbitrum.
+///
+/// The allocation set and indexer service endpoints both come from the chain here, instead of from
+/// the network subgraph via Edge & Node's gateway. That gateway call is the last operational
+/// dependency the oracle has on another team, and it sits on the critical path for paid probing.
+///
+/// Disabled by default. A nest that is still backfilling serves a partial allocation set, and
+/// switching to it early would silently shrink the probe target list rather than fail loudly - so
+/// this is opt-in per deployment, and `nest.rs` additionally refuses to answer while the nest is
+/// behind chain tip.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct NestConfig {
+    pub enabled: bool,
+    /// Base URL of the nest's HTTP API, e.g. `https://host/horizon`.
+    pub url: String,
+    /// Basic-auth credentials, when the nest sits behind a proxy that requires them.
+    pub username: Option<String>,
+    pub password: Option<String>,
+}
+
+impl Default for NestConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            url: String::new(),
+            username: None,
+            password: None,
+        }
+    }
+}
+
+
 #[derive(Debug, Deserialize, Clone)]
 #[serde(default)]
 pub struct FoghornConfig {
@@ -361,6 +394,7 @@ pub struct FoghornConfig {
     pub qos_rollup: QosRollupConfig,
     pub data_edge: DataEdgeConfig,
     pub peer_oracle: PeerOracleConfig,
+    pub nest: NestConfig,
     pub tap: TapConfig,
     /// Discord webhook URL for #foghorn-alerts. When set, new critical
     /// needs-attention items are pushed to Discord. Empty = alerting disabled.
@@ -398,6 +432,7 @@ impl Default for FoghornConfig {
             qos_rollup: QosRollupConfig::default(),
             data_edge: DataEdgeConfig::default(),
             peer_oracle: PeerOracleConfig::default(),
+            nest: NestConfig::default(),
             tap: TapConfig::default(),
             alert_webhook: None,
         }

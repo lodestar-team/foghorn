@@ -19,19 +19,94 @@ use tracing::{info, warn};
 const NETWORK_SUBGRAPH_ID: &str = "DZz4kDTdmzWLWsV373w2bSmoar3umKKH9y82SUKr5qmp";
 const GATEWAY_BASE: &str = "https://gateway-arbitrum.network.thegraph.com/api";
 
-pub async fn run_allocation_sync_loop(api_key: Option<String>, interval_secs: u64, pool: PgPool) {
+pub async fn run_allocation_sync_loop(
+    api_key: Option<String>,
+    interval_secs: u64,
+    nest: Option<crate::nest::NestClient>,
+    chain_tip: std::sync::Arc<dyn Fn() -> Option<u64> + Send + Sync>,
+    pool: PgPool,
+) {
     let Some(api_key) = api_key else {
         warn!("Allocation sync needs [gateway].api_key — paid probing will have nothing to bill");
         return;
     };
-    info!(interval = interval_secs, "Active allocation sync starting");
+    info!(
+        interval = interval_secs,
+        nest = nest.is_some(),
+        "Active allocation sync starting"
+    );
     loop {
-        match sync_once(&api_key, &pool).await {
-            Ok(n) => info!(allocations = n, "Active allocations refreshed"),
-            Err(e) => warn!(error = %e, "Allocation sync failed"),
+        // The nest first when configured, the gateway as fallback.
+        //
+        // Not because the gateway is a better source - it is the dependency we are trying to shed -
+        // but because the nest refuses to answer while it is still backfilling, and losing the
+        // allocation table would stop paid probing entirely. The fallback is a bridge, and the log
+        // says plainly which source each refresh came from so "we are off the gateway now" is a
+        // checkable claim rather than an assumption.
+        let mut done = false;
+        if let Some(client) = nest.as_ref() {
+            match chain_tip() {
+                Some(tip) => match sync_from_nest(client, tip, &pool).await {
+                    Ok(n) => {
+                        info!(allocations = n, source = "nest", "Active allocations refreshed");
+                        done = true;
+                    }
+                    Err(e) => warn!(error = %e, "Nest allocation sync unavailable, falling back to the gateway"),
+                },
+                None => warn!("Chain tip unknown, cannot judge nest freshness — using the gateway"),
+            }
+        }
+        if !done {
+            match sync_once(&api_key, &pool).await {
+                Ok(n) => info!(allocations = n, source = "gateway", "Active allocations refreshed"),
+                Err(e) => warn!(error = %e, "Allocation sync failed"),
+            }
         }
         tokio::time::sleep(Duration::from_secs(interval_secs)).await;
     }
+}
+
+/// Replace the allocation table from our own nest.
+///
+/// Same delete-then-insert-in-one-transaction shape as `sync_once`, and for the same reason: the
+/// table must never contain a closed allocation even briefly, because the scheduler reads it
+/// continuously and would bill something guaranteed to be refused.
+pub async fn sync_from_nest(
+    client: &crate::nest::NestClient,
+    chain_tip: u64,
+    pool: &PgPool,
+) -> Result<usize> {
+    let allocations = client.allocations(chain_tip).await?;
+    // Endpoints are a separate query because they fold a different event; an indexer with an
+    // allocation but no registration is normal and must not drop the allocation.
+    let endpoints: std::collections::HashMap<String, String> =
+        client.endpoints().await.unwrap_or_default().into_iter().collect();
+
+    let mut tx = pool.begin().await?;
+    sqlx::query("DELETE FROM active_allocation").execute(&mut *tx).await?;
+    for a in &allocations {
+        let indexer = a.indexer.to_lowercase();
+        sqlx::query(
+            r#"INSERT INTO active_allocation
+                   (allocation_id, indexer_address, deployment_id, indexer_url, allocated_tokens, refreshed_at)
+               VALUES ($1, $2, $3, $4, $5, NOW())
+               ON CONFLICT (allocation_id) DO UPDATE SET
+                   indexer_address = EXCLUDED.indexer_address,
+                   deployment_id   = EXCLUDED.deployment_id,
+                   indexer_url     = EXCLUDED.indexer_url,
+                   allocated_tokens = EXCLUDED.allocated_tokens,
+                   refreshed_at    = NOW()"#,
+        )
+        .bind(&a.allocation_id.to_lowercase())
+        .bind(&indexer)
+        .bind(&a.deployment_id)
+        .bind(endpoints.get(&indexer))
+        .bind(a.tokens)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(allocations.len())
 }
 
 /// Pull every active allocation and replace the table contents.
@@ -207,4 +282,47 @@ pub async fn payable_targets_for_deployment(
     .fetch_all(pool)
     .await?;
     Ok(rows)
+}
+
+/// Keep an independent view of Arbitrum's chain tip.
+///
+/// The nest reports how far it has sealed; it cannot tell us how far behind that is. Asking the
+/// nest itself would be circular — a stalled nest would report a stalled tip and look perfectly
+/// caught up, which is the failure mode this oracle exists to catch, reproduced inside the check
+/// for it. So the tip is read from the chain, separately.
+pub async fn run_chain_tip_loop(
+    rpc_url: String,
+    tip: std::sync::Arc<std::sync::atomic::AtomicU64>,
+) {
+    let client = match reqwest::Client::builder().timeout(Duration::from_secs(20)).build() {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(error = %e, "Chain tip loop could not build an HTTP client");
+            return;
+        }
+    };
+    loop {
+        match fetch_block_number(&client, &rpc_url).await {
+            Ok(n) => tip.store(n, std::sync::atomic::Ordering::Relaxed),
+            Err(e) => warn!(error = %e, "Chain tip read failed"),
+        }
+        tokio::time::sleep(Duration::from_secs(60)).await;
+    }
+}
+
+async fn fetch_block_number(client: &reqwest::Client, rpc_url: &str) -> Result<u64> {
+    let v: Value = client
+        .post(rpc_url)
+        .json(&json!({"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}))
+        .send()
+        .await
+        .context("eth_blockNumber request failed")?
+        .json()
+        .await
+        .context("eth_blockNumber returned unparseable JSON")?;
+    let hex = v
+        .get("result")
+        .and_then(|r| r.as_str())
+        .context("eth_blockNumber returned no result")?;
+    u64::from_str_radix(hex.trim_start_matches("0x"), 16).context("block number was not hex")
 }
