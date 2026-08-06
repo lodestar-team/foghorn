@@ -1321,6 +1321,91 @@ pub async fn qos_compare(
 }
 
 #[derive(Debug, Deserialize)]
+pub struct QosFeesParams {
+    pub days: Option<i32>,
+    pub limit: Option<i64>,
+}
+
+/// Realised query fees per indexer, settled on Arbitrum.
+///
+/// The one economic signal here that nobody self-reports. `QueryFeesCollected` fires when an indexer
+/// actually collects for queries it served, so this is what the network paid them, read from the
+/// chain via our own nest.
+///
+/// Deliberately NOT merged into the QoS feed's `avg_query_fee`. That field means "fee per query in
+/// this bucket" and our buckets count probes; filling it from here would credit our synthetic
+/// traffic with money an indexer earned from real users. The two answer different questions and are
+/// served separately so a consumer cannot confuse them by accident.
+pub async fn qos_fees(
+    State(state): State<AppState>,
+    Query(params): Query<QosFeesParams>,
+) -> Result<Json<Value>, StatusCode> {
+    let days: i32 = params.days.unwrap_or(30).clamp(1, 365);
+    let limit: i64 = params.limit.unwrap_or(200).clamp(1, 1000);
+
+    let rows = sqlx::query(
+        r#"SELECT indexer_address,
+                  COUNT(*)::bigint                       AS settlements,
+                  COUNT(DISTINCT deployment_id)::bigint  AS deployments,
+                  COUNT(DISTINCT payer)::bigint          AS payers,
+                  SUM(tokens_collected)::float8          AS tokens_collected,
+                  SUM(COALESCE(tokens_curators, 0))::float8 AS tokens_curators,
+                  MAX(block_timestamp)                   AS latest
+           FROM chain_query_fees
+           WHERE block_timestamp >= NOW() - make_interval(days => $1)
+           GROUP BY indexer_address
+           ORDER BY SUM(tokens_collected) DESC
+           LIMIT $2"#,
+    )
+    .bind(days)
+    .bind(limit)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let indexers: Vec<Value> = rows
+        .iter()
+        .map(|r| {
+            // GRT has 18 decimals. Converted here rather than in the browser so every consumer of
+            // this endpoint agrees on the unit.
+            let wei = r.get::<Option<f64>, _>("tokens_collected").unwrap_or(0.0);
+            let cur = r.get::<Option<f64>, _>("tokens_curators").unwrap_or(0.0);
+            json!({
+                "indexer_address": r.get::<String, _>("indexer_address"),
+                "settlements": r.get::<i64, _>("settlements"),
+                "deployments": r.get::<i64, _>("deployments"),
+                "payers": r.get::<i64, _>("payers"),
+                "grt_collected": wei / 1e18,
+                "grt_to_curators": cur / 1e18,
+                "latest_settlement": r
+                    .get::<Option<chrono::DateTime<chrono::Utc>>, _>("latest")
+                    .map(|t| t.to_rfc3339()),
+            })
+        })
+        .collect();
+
+    let (total_rows, newest): (i64, Option<chrono::DateTime<chrono::Utc>>) =
+        sqlx::query_as("SELECT COUNT(*)::bigint, MAX(block_timestamp) FROM chain_query_fees")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap_or((0, None));
+
+    Ok(Json(json!({
+        "source": "arbitrum-one",
+        "measured_from": "QueryFeesCollected on the SubgraphService, indexed by our own nuthatch nest",
+        "window_days": days,
+        "means": "GRT an indexer actually collected for queries it served, across ALL payers. Not \
+                  our probe spend, and not a per-query rate — settlement is periodic and covers many \
+                  queries at once, so there is no denominator to divide by.",
+        "not_comparable_to": "the QoS feed's avg_query_fee, which is per-query within a bucket and \
+                              stays null because our buckets count probes rather than demand",
+        "total_settlements_indexed": total_rows,
+        "newest_settlement": newest.map(|t| t.to_rfc3339()),
+        "indexers": indexers,
+    })))
+}
+
+#[derive(Debug, Deserialize)]
 pub struct QosCompareParams {
     pub days: Option<i32>,
     pub min_probes: Option<i64>,

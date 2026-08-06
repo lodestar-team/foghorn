@@ -176,6 +176,54 @@ impl NestClient {
     }
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct NestQueryFee {
+    #[serde(rename = "serviceProvider")]
+    pub indexer: String,
+    #[serde(rename = "subgraphDeploymentId")]
+    pub deployment_id: String,
+    #[serde(rename = "allocationId")]
+    pub allocation_id: String,
+    pub payer: String,
+    /// Big decimals, as JSON strings. See `NestAllocation::tokens` for what assuming otherwise costs.
+    #[serde(rename = "tokensCollected")]
+    pub tokens_collected: String,
+    #[serde(rename = "tokensCurators")]
+    pub tokens_curators: Option<String>,
+    pub block_number: i64,
+    pub block_timestamp: i64,
+    pub log_index: i64,
+}
+
+impl NestClient {
+    /// Query-fee settlements newer than `since_block`.
+    ///
+    /// Incremental by block so a restart does not refetch a year of history, and so the ingest can
+    /// keep up on a schedule rather than needing a full sweep. Unlike `allocations`, this does not
+    /// gate on nest freshness: settlement is append-only history, so a partial answer here is a
+    /// short answer rather than a wrong one, and the next pass picks up the rest.
+    pub async fn query_fees(&self, since_block: i64, limit: i64) -> Result<Vec<NestQueryFee>> {
+        let q = format!(
+            "SELECT \"serviceProvider\", \"subgraphDeploymentId\", \"allocationId\", payer, \
+             \"tokensCollected\", \"tokensCurators\", block_number, block_timestamp, log_index \
+             FROM service__query_fees_collected \
+             WHERE block_number > {since_block} \
+             ORDER BY block_number ASC, log_index ASC LIMIT {limit}"
+        );
+        let (rows, _) = self.sql::<NestQueryFee>(&q).await?;
+        Ok(rows
+            .into_iter()
+            .map(|mut f| {
+                // Same bytes32-versus-Qm normalisation as the allocation set. Without it these rows
+                // would never join to anything else in the database.
+                f.deployment_id = normalise_deployment_id(&f.deployment_id);
+                f.indexer = f.indexer.to_lowercase();
+                f
+            })
+            .collect())
+    }
+}
+
 /// Pull the service URL out of a `ServiceProviderRegistered` payload.
 ///
 /// The blob is `abi.encode(string url, string geohash, …)`: word 0 is the byte offset of `url`,

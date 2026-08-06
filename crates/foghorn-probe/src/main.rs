@@ -12,6 +12,7 @@ mod dataedge;
 mod discovery;
 mod escrow;
 mod executor;
+mod fees;
 mod ingest;
 mod nest;
 mod lodestar;
@@ -105,6 +106,15 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 None
             };
+            let fee_nest = if config.nest.enabled && !config.nest.url.is_empty() {
+                let auth = match (&config.nest.username, &config.nest.password) {
+                    (Some(u), Some(p)) => Some((u.clone(), p.clone())),
+                    _ => None,
+                };
+                nest::NestClient::new(&config.nest.url, auth).ok()
+            } else {
+                None
+            };
             // Chain tip, read from the same RPC the escrow sync uses. The nest is only trusted when
             // it is caught up, and "caught up" is meaningless without an independent tip.
             let rpc = config
@@ -128,6 +138,12 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }) as std::sync::Arc<dyn Fn() -> Option<u64> + Send + Sync>
             };
+            // Realised query fees from the same nest. Separate loop because it answers a different
+            // question on a different cadence: settlement is append-only history, not current state.
+            if let Some(fee_nest) = fee_nest {
+                let pool = pool.clone();
+                tokio::spawn(async move { fees::run_fee_ingest_loop(fee_nest, 300, pool).await });
+            }
             tokio::spawn(async move {
                 allocations::run_allocation_sync_loop(api_key, secs, nest, tip_reader, pool).await
             });
