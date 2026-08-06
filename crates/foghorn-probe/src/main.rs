@@ -189,6 +189,12 @@ async fn main() -> anyhow::Result<()> {
         let roster_pool = pool.clone();
         tokio::spawn(async move { alerter::run_alert_loop(roster_hook, roster_pool).await });
         // Separate loop: oracle liveness needs minutes, the roster digest needs hours.
+        // Watching Edge & Node's feed for going stale while looking healthy, and our own scoring
+        // for the same thing. The second one exists because a GROUP BY error froze every grade on
+        // the public board and only turned up by chance.
+        let self_hook = webhook.clone();
+        let self_pool = pool.clone();
+        tokio::spawn(async move { alerter::run_self_watch_loop(self_hook, self_pool).await });
         tokio::spawn(async move { alerter::run_oracle_watch_loop(webhook, pool).await });
     } else {
         info!("No alert_webhook configured — Discord alerting disabled");

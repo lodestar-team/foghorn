@@ -396,6 +396,112 @@ async fn alert_oracle_stall(client: &reqwest::Client, webhook: &str, pool: &PgPo
     Ok(())
 }
 
+/// How stale the grades may get before it is a fault rather than a gap.
+///
+/// The scoring loop runs on `scoring.interval_secs` (900 in production). Four missed cycles is an
+/// hour of a public board showing numbers nobody recomputed.
+const SCORE_STALE_SECS: i64 = 3600;
+
+/// Watch our OWN scoring for having quietly stopped.
+///
+/// This exists because it happened. A `GROUP BY` mistake made every scoring cycle fail, the failure
+/// logged a warning nobody was reading, and the public grade board simply froze — every indexer
+/// keeping the letter it had, indefinitely, with nothing on the page suggesting the numbers had
+/// stopped moving. It was found by chance, hours later.
+///
+/// Deliberately measures the OUTPUT, not the process. A liveness heartbeat on the loop would have
+/// ticked happily throughout: the loop was running fine, it was the work inside it that failed. The
+/// only honest question is whether the grades are actually being recomputed, so that is what this
+/// asks — `max(computed_at)` on the scores themselves.
+///
+/// The same reasoning the whole oracle is built on, turned inward. We caught Edge & Node's feed
+/// going stale while reporting itself healthy; nothing was watching ours.
+pub async fn run_self_watch_loop(webhook: String, pool: PgPool) {
+    info!(interval = ORACLE_POLL_SECS, "Score staleness watch starting");
+    let client = match reqwest::Client::builder().timeout(Duration::from_secs(15)).build() {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(error = %e, "Failed to build self-watch client — score alerting disabled");
+            return;
+        }
+    };
+    loop {
+        if let Err(e) = alert_score_stall(&client, &webhook, &pool).await {
+            warn!(error = %e, "Score staleness alert failed");
+        }
+        tokio::time::sleep(Duration::from_secs(ORACLE_POLL_SECS)).await;
+    }
+}
+
+async fn alert_score_stall(client: &reqwest::Client, webhook: &str, pool: &PgPool) -> Result<()> {
+    let newest: Option<chrono::DateTime<chrono::Utc>> =
+        sqlx::query_scalar("SELECT max(computed_at) FROM indexer_score")
+            .fetch_one(pool)
+            .await
+            .unwrap_or(None);
+
+    // No scores at all is a fresh database, not a stall. Saying otherwise would page someone on
+    // first boot, and an alerter that cries wolf gets muted, which is worse than not having one.
+    let Some(newest) = newest else { return Ok(()) };
+
+    let age = (chrono::Utc::now() - newest).num_seconds();
+    let stalled = age > SCORE_STALE_SECS;
+
+    let previous: Option<String> =
+        sqlx::query_scalar("SELECT value FROM alerter_flag WHERE key = 'score_stall'")
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten();
+    let now_state = if stalled { "stalled" } else { "live" };
+    if previous.as_deref() == Some(now_state) {
+        return Ok(());
+    }
+    // Only announce recovery if we announced the stall; otherwise a first run posts "all fine".
+    if !stalled && previous.is_none() {
+        sqlx::query(
+            r#"INSERT INTO alerter_flag (key, value, updated_at) VALUES ('score_stall', 'live', NOW())
+               ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()"#,
+        )
+        .execute(pool)
+        .await?;
+        return Ok(());
+    }
+
+    let content = if stalled {
+        format!(
+            "**Lodestar Oracle scoring has stopped**\n\
+             Newest grade computed: `{}` ({:.1}h ago).\n\
+             The grade board at <https://www.lodestar-dashboard.com/qos> is showing numbers nobody \
+             has recomputed since then. Every indexer is keeping whatever letter it last had.\n\
+             Check `Scoring cycle failed` in the probe logs — the loop keeps running when the work \
+             inside it fails, so the process looking healthy means nothing here.",
+            newest.to_rfc3339(),
+            age as f64 / 3600.0,
+        )
+    } else {
+        format!(
+            "**Lodestar Oracle scoring is running again**\nNewest grade computed: `{}` ({}m ago).",
+            newest.to_rfc3339(),
+            age / 60,
+        )
+    };
+
+    if !post_chunks(client, webhook, &content).await? {
+        return Ok(());
+    }
+
+    sqlx::query(
+        r#"INSERT INTO alerter_flag (key, value, updated_at) VALUES ('score_stall', $1, NOW())
+           ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()"#,
+    )
+    .bind(now_state)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
 /// Post `content`, splitting on newlines into messages under Discord's char cap.
 /// Returns false (without erroring) if the webhook rejects a chunk.
 async fn post_chunks(client: &reqwest::Client, webhook: &str, content: &str) -> Result<bool> {
