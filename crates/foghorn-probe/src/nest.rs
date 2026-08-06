@@ -18,6 +18,7 @@
 //! [`NestClient::allocations`] refuses to answer at all until the nest says it is current.
 
 use anyhow::{bail, Context, Result};
+use foghorn_core::deployment::normalise_deployment_id;
 use serde::Deserialize;
 use std::time::Duration;
 
@@ -57,10 +58,15 @@ pub struct NestAllocation {
     #[serde(rename = "allocationId")]
     pub allocation_id: String,
     pub indexer: String,
+    /// As the chain stores it: a bytes32 id, NOT the `Qm…` IPFS hash. Normalised on the way out of
+    /// [`NestClient::allocations`] - see the note there, this one bites silently.
     #[serde(rename = "subgraphDeploymentId")]
     pub deployment_id: String,
+    /// A big decimal, arriving as a JSON **string**. Declaring it `f64` made every response
+    /// "unparseable JSON" and sent the sync quietly back to the gateway, which is a fallback doing
+    /// its job and hiding a bug while it does.
     #[serde(default)]
-    pub tokens: Option<f64>,
+    pub tokens: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -132,6 +138,21 @@ impl NestClient {
         if rows.is_empty() {
             bail!("nest returned no active allocations — refusing to clear the table");
         }
+
+        // Normalise deployment ids to their `Qm…` form.
+        //
+        // The chain stores bytes32; everything else in Foghorn - `foghorn_qos`, the test-sets, the
+        // served `subgraph_deployment_ipfs_hash` field - speaks IPFS hashes. Leaving these as hex
+        // would mean `payable_targets_for_deployment` matched nothing for every deployment, so paid
+        // probing would find no targets and simply stop, with no error anywhere. The same two forms
+        // in one column already cost us a day; they do not get a second go.
+        let rows = rows
+            .into_iter()
+            .map(|mut a| {
+                a.deployment_id = normalise_deployment_id(&a.deployment_id);
+                a
+            })
+            .collect();
         Ok(rows)
     }
 

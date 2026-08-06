@@ -99,7 +99,7 @@ pub async fn sync_from_nest(
         sqlx::query(
             r#"INSERT INTO active_allocation
                    (allocation_id, indexer_address, deployment_id, indexer_url, allocated_tokens, refreshed_at)
-               VALUES ($1, $2, $3, $4, $5, NOW())
+               VALUES ($1, $2, $3, $4, CAST($5 AS numeric), NOW())
                ON CONFLICT (allocation_id) DO UPDATE SET
                    indexer_address = EXCLUDED.indexer_address,
                    deployment_id   = EXCLUDED.deployment_id,
@@ -111,7 +111,7 @@ pub async fn sync_from_nest(
         .bind(&indexer)
         .bind(&a.deployment_id)
         .bind(endpoints.get(&indexer))
-        .bind(a.tokens)
+        .bind(a.tokens.as_deref())
         .execute(&mut *tx)
         .await?;
     }
