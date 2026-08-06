@@ -2748,6 +2748,7 @@ name = "foghorn-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bs58",
  "chrono",
  "config",
  "hex",

@@ -12,6 +12,7 @@
 
 use crate::discovery::get_safe_block;
 use foghorn_core::config::FoghornConfig;
+use foghorn_core::deployment::normalise_deployment_id;
 use foghorn_core::types::{TestQuery, TestSet, TestSetDeployment};
 use serde_json::{json, Value};
 use std::time::Duration;
@@ -71,8 +72,11 @@ pub async fn discover_test_sets(cfg: &FoghornConfig, limit: usize) -> Vec<TestSe
         info!(deployment = %cand.ipfs_hash, network = %cand.network, entity = %field, "Auto-probe deployment");
         out.push(TestSet {
             deployment: TestSetDeployment {
-                id: cand.ipfs_hash.clone(),
-                ipfs_hash: cand.ipfs_hash.clone(),
+                // Normalised even though the network subgraph already returns `Qm…`: this is the
+                // other door ids come in through, and the two must agree or the same deployment
+                // splits into two rows again.
+                id: normalise_deployment_id(&cand.ipfs_hash),
+                ipfs_hash: normalise_deployment_id(&cand.ipfs_hash),
                 network: cand.network.clone(),
                 description: format!("auto:{} ({})", field, cand.network),
                 gateway_subgraph_id: None, // probe by deployment ipfs hash

@@ -8,7 +8,7 @@ use crate::{
 };
 use anyhow::Result;
 use chrono::Utc;
-use foghorn_core::{config::FoghornConfig, types::TestSet};
+use foghorn_core::{config::FoghornConfig, deployment::normalise_deployment_id, types::TestSet};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use std::time::Duration;
@@ -29,6 +29,24 @@ pub async fn run_probe_scheduler(config: FoghornConfig, pool: PgPool) -> Result<
     // and generate block-pinned probe queries via schema introspection.
     if config.auto_discover_limit > 0 {
         let discovered = crate::autodiscover::discover_test_sets(&config, config.auto_discover_limit).await;
+        // Curated sets win over discovered ones for the same deployment: they carry hand-written
+        // queries chosen to be deterministic, where auto-discovery guesses an entity. Before ids
+        // were normalised these never collided, so ens and premia were each probed twice per round
+        // under two different ids — double the traffic, and each deployment's rollup split across
+        // two rows that each looked like half a deployment.
+        let curated: std::collections::HashSet<String> =
+            test_sets.iter().map(|ts| ts.deployment.id.clone()).collect();
+        let before = discovered.len();
+        let discovered: Vec<_> = discovered
+            .into_iter()
+            .filter(|ts| !curated.contains(&ts.deployment.id))
+            .collect();
+        if before != discovered.len() {
+            info!(
+                dropped = before - discovered.len(),
+                "Discovered deployments already covered by a curated test set"
+            );
+        }
         test_sets.extend(discovered);
         info!(total = test_sets.len(), "Test sets after auto-discovery");
     }
@@ -375,7 +393,13 @@ fn load_test_sets(dir: &str) -> Result<Vec<TestSet>> {
         if p.extension().and_then(|e| e.to_str()) == Some("yaml") {
             let content = std::fs::read_to_string(&p)?;
             match serde_yaml::from_str::<TestSet>(&content) {
-                Ok(ts) => {
+                Ok(mut ts) => {
+                    // Curated test-sets are hand-written and four of them carried bytes32 ids while
+                    // auto-discovery produces `Qm…`. Both went into the same `deployment_id` column,
+                    // served under a field named `subgraph_deployment_ipfs_hash` — so the id was
+                    // wrong for a consumer, AND two of those deployments were being probed twice
+                    // under two names, splitting their rollups in half.
+                    ts.deployment.id = normalise_deployment_id(&ts.deployment.id);
                     info!(file = ?p, deployment = %ts.deployment.description, "Loaded test set");
                     test_sets.push(ts);
                 }
