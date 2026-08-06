@@ -176,7 +176,11 @@ async fn load_probe_agg(pool: &PgPool, interval: &str) -> Result<HashMap<String,
                SELECT probe_id, COUNT(*) FILTER (WHERE response_hash IS NOT NULL) AS n
                FROM observation GROUP BY probe_id
            )
-           SELECT am.indexer_address AS addr,
+           -- See qos.rs: a gateway observation carries the allocation signing key, a paid one
+           -- carries the indexer itself. Resolving both through allocation_map dropped every paid
+           -- observation, so grades were computed from gateway data only while the page reported
+           -- direct coverage.
+           SELECT COALESCE(am.indexer_address, o.indexer_address) AS addr,
                   COUNT(*)::bigint AS total,
                   COUNT(*) FILTER (WHERE o.error_class IS NOT NULL OR o.response_hash IS NULL)::bigint AS errors,
                   COUNT(DISTINCT o.probe_id) FILTER (WHERE o.response_hash IS NOT NULL) AS probes_answered,
@@ -195,9 +199,10 @@ async fn load_probe_agg(pool: &PgPool, interval: &str) -> Result<HashMap<String,
            JOIN probe p ON p.id = o.probe_id
            LEFT JOIN divergence d ON d.probe_id = o.probe_id
            LEFT JOIN responders r ON r.probe_id = o.probe_id
-           JOIN allocation_map am ON am.allocation_key = o.indexer_address
+           LEFT JOIN allocation_map am ON am.allocation_key = o.indexer_address
                 AND am.indexer_address IS NOT NULL
            WHERE p.dispatched_at > NOW() - $1::interval
+             AND (am.indexer_address IS NOT NULL OR o.dispatch_mode = 'paid')
              -- Payment refusals describe our escrow, not the operator. Left in, they would drive
              -- the availability sub-score — and therefore the public grade — straight down for
              -- every indexer whose tap-agent has not yet seen our deposit. See qos.rs for the full

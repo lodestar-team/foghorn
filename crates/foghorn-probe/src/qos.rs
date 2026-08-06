@@ -73,7 +73,18 @@ pub async fn rollup_once(cfg: &QosRollupConfig, pool: &PgPool) -> Result<u64> {
                 -- dropped rather than published under a signing key. Attributing quality to the
                 -- wrong identity is a worse failure than missing a row, because a reader cannot
                 -- tell it happened.
-                m.indexer_address,
+                -- Identity depends on HOW the probe was dispatched, and getting this wrong silently
+                -- discards data rather than corrupting it, which is harder to notice.
+                --
+                -- A gateway observation's `indexer_address` is the allocation SIGNING KEY recovered
+                -- from the attestation, so it must be resolved through `allocation_map`. A paid
+                -- observation's is already the indexer: we chose who to pay, so there is nothing to
+                -- recover. The join below used to be an INNER JOIN on the signing key for both,
+                -- which meant every paid observation matched nothing and was dropped — the whole
+                -- point of paid probing produced rows that never reached the feed or the grades,
+                -- while the dispatch-mix counter (which does not join) happily reported them as
+                -- coverage. Unbiased data, counted and then thrown away.
+                COALESCE(m.indexer_address, o.indexer_address) AS indexer_address,
                 p.deployment_id,
                 to_timestamp(floor(extract(epoch FROM p.dispatched_at) / $1) * $1) AS bucket_start,
                 o.latency_ms,
@@ -103,12 +114,16 @@ pub async fn rollup_once(cfg: &QosRollupConfig, pool: &PgPool) -> Result<u64> {
                 (nd.deployment_id IS NOT NULL) AS nondeterministic
             FROM observation o
             JOIN probe p ON p.id = o.probe_id
-            JOIN allocation_map m
+            -- LEFT, so a paid observation survives having no signing-key entry. The WHERE below
+            -- still drops a GATEWAY observation we cannot attribute: publishing quality under a
+            -- signing key would put the wrong name on it, which is worse than missing a row.
+            LEFT JOIN allocation_map m
               ON m.allocation_key = o.indexer_address
              AND m.indexer_address IS NOT NULL
             LEFT JOIN divergence d ON d.probe_id = o.probe_id
             LEFT JOIN nondeterministic_deployment nd ON nd.deployment_id = p.deployment_id
             WHERE p.dispatched_at >= NOW() - make_interval(secs => $2)
+              AND (m.indexer_address IS NOT NULL OR o.dispatch_mode = 'paid')
               -- A refused payment is a fact about OUR escrow, never about the indexer.
               --
               -- `payment_denylisted` means their tap-agent has not yet observed our deposit;
