@@ -865,7 +865,10 @@ async fn measured_block(pool: &sqlx::PgPool, filter: crate::qos::DailyFilter) ->
                 .first()
                 .and_then(|r| r.get::<Option<String>, _>("gateway_id"));
             let points: Vec<Value> = rows.iter().map(crate::qos::row_to_oracle_json).collect();
-            let mut block = crate::qos::measured_provenance(gateway_id.as_deref());
+            // 24h mix: this endpoint serves daily rollups, and the caveat should describe how the
+            // data was actually gathered rather than restate a constant.
+            let mix = crate::qos::dispatch_mix(pool, 24).await;
+            let mut block = crate::qos::measured_provenance(gateway_id.as_deref(), Some(mix));
             block["allocationDailyDataPoints"] = json!(points);
             block
         }
@@ -1378,7 +1381,9 @@ pub async fn qos_buckets(
         "correctness_rate": r.get::<Option<f64>, _>("correctness_rate"),
     })).collect();
 
-    let mut out = crate::qos::measured_provenance(None);
+    // Mix measured over the SAME window the buckets cover, so the caveat and the data agree.
+    let mix = crate::qos::dispatch_mix(&state.pool, hours).await;
+    let mut out = crate::qos::measured_provenance(None, Some(mix));
     out["window_hours"] = json!(hours);
     out["buckets"] = json!(buckets);
     Ok(Json(out))

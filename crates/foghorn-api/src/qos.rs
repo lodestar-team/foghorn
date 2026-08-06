@@ -298,27 +298,90 @@ pub fn row_to_oracle_json(r: &PgRow) -> Value {
 /// Served inline rather than kept in documentation on purpose: `query_count` here counts probes
 /// Foghorn chose to dispatch, not organic traffic a gateway routed. Anyone reading probe volume
 /// as market demand would be badly wrong, so the correction travels with the data.
-pub fn measured_provenance(gateway_id: Option<&str>) -> Value {
+pub fn measured_provenance(gateway_id: Option<&str>, mix: Option<DispatchMix>) -> Value {
+    // The bias caveat is derived from the actual dispatch mix, never asserted.
+    //
+    // It used to read "probes are routed by E&N's gateway" flat out. That was true when every probe
+    // went that way and became false the moment paid direct dispatch was switched on — and a stale
+    // caveat is its own kind of dishonesty: it would have understated the feed indefinitely, and
+    // nobody would have noticed, because a disclaimer that is too harsh attracts no complaints.
+    //
+    // Paid probes carry no selection bias: we choose the indexer, so an indexer that would fail is
+    // observed failing. Gateway probes do: the gateway routes to indexers it believes are healthy,
+    // so the failures it avoids never reach us. With both running, the honest statement is how much
+    // of the data came from each.
+    let bias = match mix {
+        Some(m) if m.total == 0 => "UNKNOWN — no probes in this window.".to_string(),
+        Some(m) if m.paid == m.total => format!(
+            "NONE — all {} probes in this window were dispatched directly by us and paid with TAP \
+             receipts, so indexers that fail are observed failing.",
+            m.total
+        ),
+        Some(m) if m.paid == 0 => format!(
+            "OPTIMISTIC — all {} probes in this window were routed by Edge & Node's gateway, which \
+             sends queries to indexers it believes are healthy, so failures it already avoids are \
+             invisible to us. Treat proportion_indexer_200_responses as an upper bound.",
+            m.total
+        ),
+        Some(m) => format!(
+            "PARTIAL — {:.0}% of probes in this window ({} of {}) were dispatched directly by us and \
+             paid with TAP receipts, and carry no selection bias. The remaining {:.0}% were routed by \
+             Edge & Node's gateway, which avoids indexers it believes are unhealthy, so that portion \
+             is an upper bound. The two are mixed in these aggregates; `dispatch_mode` separates them \
+             per observation.",
+            100.0 * m.paid as f64 / m.total as f64,
+            m.paid,
+            m.total,
+            100.0 * (m.total - m.paid) as f64 / m.total as f64,
+        ),
+        None => "OPTIMISTIC — probes are routed by Edge & Node's gateway, so indexers it declines \
+                 to route to are never observed failing. Treat proportion_indexer_200_responses as \
+                 an upper bound."
+            .to_string(),
+    };
+
     json!({
-        "source": "foghorn",
+        "source": "lodestar-oracle",
         "gateway_id": gateway_id.unwrap_or("lodestar"),
         "method": "active block-pinned probing, JCS-canonicalised response clustering",
-        "query_count_means": "probes dispatched by Foghorn, NOT organic gateway traffic",
+        "query_count_means": "probes we dispatched, NOT organic gateway traffic",
         "independent_of": "Edge & Node QoS oracle pipeline",
-        // Stated in-band because it is the one caveat that changes how a number should be read,
-        // and because the oracle comparison exposes it plainly: across 20 overlapping allocations
-        // our success rate was higher than theirs every single time, never lower. That is not them
-        // being wrong — probes are dispatched through E&N's gateway, which routes to indexers it
-        // believes are healthy, so failures it already avoids are invisible to us.
-        //
-        // Removing the bias needs direct-to-indexer dispatch, which needs TAP receipts: every
-        // indexer tested returns `402 No Tap receipt was found in the request`, so unpaid direct
-        // probing is not possible. Until then this field is a ceiling, not a measurement.
-        "success_rate_bias": "OPTIMISTIC — probes are routed by E&N's gateway, so indexers it \
-                              declines to route to are never observed failing. Treat \
-                              proportion_indexer_200_responses as an upper bound.",
+        "success_rate_bias": bias,
+        "dispatch": mix.map(|m| json!({
+            "paid_direct": m.paid,
+            "via_gateway": m.total - m.paid,
+            "note": "Paid probes are unbiased because we choose the indexer. Payment refusals are \
+                     excluded from these counts and from every measurement: they describe our \
+                     escrow, not the operator.",
+        })),
         "unbiased_fields": "avg/max_indexer_blocks_behind (chainhead resolved independently) and \
                             correctness_rate (responses compared against each other, not reported \
                             by the indexer)",
     })
+}
+
+/// How a window's observations were obtained. Drives the bias caveat, so it is read from the data.
+#[derive(Debug, Clone, Copy)]
+pub struct DispatchMix {
+    pub paid: i64,
+    pub total: i64,
+}
+
+/// Count paid vs total observations over a trailing window, excluding payment refusals — those are
+/// not observations of any indexer, so counting them would misstate how much real data is unbiased.
+pub async fn dispatch_mix(pool: &PgPool, hours: i32) -> DispatchMix {
+    let row: (i64, i64) = sqlx::query_as(
+        r#"SELECT
+               COUNT(*) FILTER (WHERE o.dispatch_mode = 'paid')::bigint,
+               COUNT(*)::bigint
+           FROM observation o
+           JOIN probe p ON p.id = o.probe_id
+           WHERE p.dispatched_at >= NOW() - make_interval(hours => $1)
+             AND (o.error_class IS NULL OR o.error_class NOT LIKE 'payment\_%')"#,
+    )
+    .bind(hours)
+    .fetch_one(pool)
+    .await
+    .unwrap_or((0, 0));
+    DispatchMix { paid: row.0, total: row.1 }
 }
