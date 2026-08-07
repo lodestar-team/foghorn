@@ -252,20 +252,64 @@ async fn load_probe_agg(pool: &PgPool, interval: &str) -> Result<HashMap<String,
 
 /// Flag deployments that diverge persistently (every round, across blocks) as
 /// non-deterministic — the subgraph's mappings, not the indexers, are at fault.
+/// Deployments where honest indexers cannot agree, distinguished from deployments with a bad indexer.
+///
+/// This used to be a flat divergence rate: 50% of probes divergent and you were non-deterministic.
+/// That cannot tell the two cases apart, and it missed the clearest example in our own data -
+/// `QmTZ8ejXJx…` sat at 42.5% divergence and was never flagged, so its rotating disagreements kept
+/// presenting as indexers serving wrong data.
+///
+/// The discriminating signal is not HOW OFTEN the minority appears but WHO is in it.
+///
+///   - Minority rotates across several indexers  → the subgraph is non-deterministic. Nobody is at
+///     fault, and faulting anyone for it is a slander the data does not support.
+///   - Same indexer in the minority nearly every time → that indexer is serving wrong data, which is
+///     precisely the finding this oracle exists to make.
+///
+/// Measured on live data: `QmTZ8ejXJx…` had 4 distinct minority indexers with the worst accounting
+/// for 40% of minority positions (non-deterministic), while `QmasYjypV…` had one accounting for 83%
+/// (an indexer). A rate threshold ranks those identically; concentration separates them cleanly.
 async fn detect_nondeterministic(pool: &PgPool) -> Result<()> {
     let rows = sqlx::query(
-        r#"SELECT p.deployment_id,
-                  COUNT(DISTINCT p.id)::int AS total,
-                  COUNT(DISTINCT d.probe_id)::int AS divergent
-           FROM probe p
-           -- `cluster_count > 1` is what makes a row a DISAGREEMENT. Rows are now written for
-           -- every corroborated probe, including ones where all indexers matched, so a bare
-           -- existence check here would mark every well-corroborated deployment non-deterministic.
-           LEFT JOIN divergence d ON d.probe_id = p.id AND d.cluster_count > 1
-           WHERE p.dispatched_at > NOW() - INTERVAL '7 days'
-           GROUP BY p.deployment_id
-           HAVING COUNT(DISTINCT d.probe_id) >= 3
-              AND COUNT(DISTINCT d.probe_id)::float8 / NULLIF(COUNT(DISTINCT p.id), 0) >= 0.5"#,
+        r#"WITH minority AS (
+               SELECT p.deployment_id,
+                      COALESCE(m.indexer_address, o.indexer_address) AS ix,
+                      COUNT(*) AS times
+               FROM observation o
+               JOIN probe p ON p.id = o.probe_id
+               JOIN divergence d ON d.probe_id = o.probe_id AND d.cluster_count > 1
+               LEFT JOIN allocation_map m ON m.allocation_key = o.indexer_address
+               WHERE o.response_hash IS NOT NULL
+                 AND o.response_hash <> d.largest_by_count_hash
+                 AND p.dispatched_at > NOW() - INTERVAL '7 days'
+               GROUP BY 1, 2
+           ),
+           spread AS (
+               SELECT deployment_id,
+                      COUNT(*)                                        AS minority_indexers,
+                      SUM(times)                                      AS minority_total,
+                      MAX(times)::float8 / NULLIF(SUM(times), 0)       AS concentration
+               FROM minority GROUP BY 1
+           ),
+           totals AS (
+               SELECT p.deployment_id,
+                      COUNT(DISTINCT p.id)::int                        AS total,
+                      COUNT(DISTINCT d.probe_id)::int                  AS divergent
+               FROM probe p
+               LEFT JOIN divergence d ON d.probe_id = p.id AND d.cluster_count > 1
+               WHERE p.dispatched_at > NOW() - INTERVAL '7 days'
+               GROUP BY 1
+           )
+           SELECT t.deployment_id, t.total, t.divergent
+           FROM totals t JOIN spread s ON s.deployment_id = t.deployment_id
+           WHERE t.divergent >= 3
+             -- Material disagreement. Lower than the old 0.5 because rotation, not frequency, is
+             -- what now carries the claim.
+             AND t.divergent::float8 / NULLIF(t.total, 0) >= 0.2
+             -- And it must actually rotate. One indexer holding most of the minority positions is an
+             -- indexer problem, and flagging the deployment would excuse it.
+             AND s.minority_indexers >= 2
+             AND s.concentration <= 0.6"#,
     )
     .fetch_all(pool)
     .await?;

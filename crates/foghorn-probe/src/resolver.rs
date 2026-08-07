@@ -1,6 +1,7 @@
 use anyhow::Result;
 use serde::Deserialize;
 use serde_json::json;
+use std::time::Duration;
 use sqlx::PgPool;
 use std::collections::HashSet;
 use tracing::{info, warn};
@@ -63,7 +64,16 @@ pub async fn resolve_allocation_keys(
         NETWORK_SUBGRAPH_ID
     );
 
-    let client = reqwest::Client::new();
+    // A timeout, because the alternative is a task that hangs forever.
+    //
+    // `Client::new()` has NO default timeout. This loop runs inside the probe round, so a gateway
+    // that accepts the connection and then never answers would wedge the whole round silently -
+    // the same shape as the panic that froze the grade board overnight: process healthy, logs quiet,
+    // work stopped. This was the last client in the codebase without one.
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
 
     for chunk in unresolved.chunks(100) {
         let ids: Vec<String> = chunk.iter().map(|s| s.to_lowercase()).collect();
