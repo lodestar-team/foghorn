@@ -1431,31 +1431,32 @@ pub async fn qos_conflicts(
     let days: i32 = params.days.unwrap_or(7).clamp(1, 90);
     let limit: i64 = params.limit.unwrap_or(100).clamp(1, 500);
 
+    // Grouped by probe, not expanded into pairs.
+    //
+    // A dispute is filed between two attestations, so a pair is the right unit for FILING - but the
+    // wrong unit for reading. Three indexers disagreeing produces three near-identical pair rows,
+    // and the page ends up listing one deployment four times saying much the same thing. Return
+    // each probe once with everyone who signed, and let a filer pick any two.
     let rows = sqlx::query(
-        r#"SELECT a.probe_id,
+        r#"SELECT o.probe_id,
                   p.deployment_id,
                   p.block_number,
                   p.dispatched_at,
-                  a.request_cid,
-                  am.indexer_address  AS indexer_a,
-                  a.response_cid      AS response_cid_a,
-                  a.attestation       AS attestation_a,
-                  bm.indexer_address  AS indexer_b,
-                  b.response_cid      AS response_cid_b,
-                  b.attestation       AS attestation_b
-           FROM observation a
-           JOIN observation b
-             ON b.probe_id = a.probe_id
-            AND b.response_cid IS NOT NULL
-            -- Same request, different answer. Ordered so each pair appears once rather than twice.
-            AND b.response_cid <> a.response_cid
-            AND b.indexer_address > a.indexer_address
-           JOIN probe p ON p.id = a.probe_id
-           LEFT JOIN allocation_map am ON am.allocation_key = a.indexer_address
-           LEFT JOIN allocation_map bm ON bm.allocation_key = b.indexer_address
-           WHERE a.response_cid IS NOT NULL
-             AND a.request_cid = b.request_cid
+                  o.request_cid,
+                  json_agg(json_build_object(
+                      'indexer', COALESCE(m.indexer_address, o.indexer_address),
+                      'resolved', m.indexer_address IS NOT NULL,
+                      'response_cid', o.response_cid,
+                      'attestation', o.attestation
+                  ) ORDER BY o.indexer_address) AS signers,
+                  count(DISTINCT o.response_cid) AS distinct_answers
+           FROM observation o
+           JOIN probe p ON p.id = o.probe_id
+           LEFT JOIN allocation_map m ON m.allocation_key = o.indexer_address
+           WHERE o.response_cid IS NOT NULL
              AND p.dispatched_at >= NOW() - make_interval(days => $1)
+           GROUP BY o.probe_id, p.deployment_id, p.block_number, p.dispatched_at, o.request_cid
+           HAVING count(*) >= 2 AND count(DISTINCT o.response_cid) > 1
            ORDER BY p.dispatched_at DESC
            LIMIT $2"#,
     )
@@ -1476,16 +1477,8 @@ pub async fn qos_conflicts(
                     .get::<chrono::DateTime<chrono::Utc>, _>("dispatched_at")
                     .to_rfc3339(),
                 "request_cid": r.get::<Option<String>, _>("request_cid"),
-                "a": {
-                    "indexer": r.get::<Option<String>, _>("indexer_a"),
-                    "response_cid": r.get::<Option<String>, _>("response_cid_a"),
-                    "attestation": r.get::<Option<Value>, _>("attestation_a"),
-                },
-                "b": {
-                    "indexer": r.get::<Option<String>, _>("indexer_b"),
-                    "response_cid": r.get::<Option<String>, _>("response_cid_b"),
-                    "attestation": r.get::<Option<Value>, _>("attestation_b"),
-                },
+                "distinct_answers": r.get::<i64, _>("distinct_answers"),
+                "signers": r.get::<Value, _>("signers"),
             })
         })
         .collect();
@@ -1493,13 +1486,15 @@ pub async fn qos_conflicts(
     Ok(Json(json!({
         "window_days": days,
         "count": conflicts.len(),
-        "means": "Two indexers signed different responseCIDs for the identical request on the same \
-                  deployment. Under DisputeManager this is a conflicting-attestation dispute, \
-                  filable with no deposit.",
-        "not_a_verdict": "A conflict says the two disagreed, not which one is wrong. Resolving that \
-                          is the arbitrator's job, and we are not it.",
+        "means": "Indexers that answered the identical request on the same deployment and signed \
+                  different responseCIDs. Under DisputeManager any two of them form a \
+                  conflicting-attestation dispute, filable with no deposit.",
+        "not_a_verdict": "A conflict shows the signers disagreed. It does not show which is wrong, \
+                          and it does not mean exactly one of them is: they can all be wrong, and a \
+                          non-deterministic subgraph makes honest indexers disagree forever. \
+                          Deciding is an arbitrator's job, not ours.",
         "how_to_check": "Recover the signer from each attestation; it is the allocation id, and the \
-                         chain maps it to the indexer. Nothing here needs to be taken on our word.",
+                         chain maps it to the indexer. Nothing here needs taking on our word.",
         "conflicts": conflicts,
     })))
 }
