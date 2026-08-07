@@ -1461,7 +1461,17 @@ pub async fn qos_conflicts(
                       'response_cid', o.response_cid,
                       'attestation', o.attestation
                   ) ORDER BY o.indexer_address) AS signers,
-                  count(DISTINCT o.response_cid) AS distinct_answers
+                  count(DISTINCT o.response_cid)  AS distinct_answers,
+                  -- The decisive column. `response_cid` is keccak256 over RAW bytes; `response_hash`
+                  -- is our JCS-canonicalised hash of the same payload. When the CIDs differ but the
+                  -- JCS hashes agree, the indexers returned THE SAME DATA serialised differently -
+                  -- key order, whitespace, number formatting - and nobody is serving anything wrong.
+                  --
+                  -- 29 of the first 32 conflicts this endpoint produced were exactly that, and were
+                  -- briefly published next to named operators and the word slashable. They are a
+                  -- graph-node determinism observation, not an accusation, and they are separated
+                  -- here rather than quietly dropped.
+                  count(DISTINCT o.response_hash) AS distinct_payloads
            FROM observation o
            JOIN probe p ON p.id = o.probe_id
            LEFT JOIN allocation_map m ON m.allocation_key = o.indexer_address
@@ -1490,6 +1500,10 @@ pub async fn qos_conflicts(
                     .to_rfc3339(),
                 "request_cid": r.get::<Option<String>, _>("request_cid"),
                 "distinct_answers": r.get::<i64, _>("distinct_answers"),
+                "distinct_payloads": r.get::<i64, _>("distinct_payloads"),
+                // True only when the DATA differs, not merely its serialisation. This is the flag
+                // that decides whether anyone is being accused of anything.
+                "data_differs": r.get::<i64, _>("distinct_payloads") > 1,
                 "signers": r.get::<Value, _>("signers"),
             })
         })
@@ -1501,6 +1515,11 @@ pub async fn qos_conflicts(
         "means": "Indexers that answered the identical request on the same deployment and signed \
                   different responseCIDs. Under DisputeManager any two of them form a \
                   conflicting-attestation dispute, filable with no deposit.",
+        "read_data_differs_first": "When `data_differs` is false the signers returned THE SAME DATA \
+                                    with different byte serialisation. DisputeManager compares bytes \
+                                    so it would still accept the dispute, but nobody served anything \
+                                    wrong and it should not be read as though they had. Only \
+                                    `data_differs: true` means the answers actually disagree.",
         "not_a_verdict": "A conflict shows the signers disagreed. It does not show which is wrong, \
                           and it does not mean exactly one of them is: they can all be wrong, and a \
                           non-deterministic subgraph makes honest indexers disagree forever. \
