@@ -1452,6 +1452,12 @@ pub async fn qos_conflicts(
                       'indexer', COALESCE(m.indexer_address,
                                           CASE WHEN o.dispatch_mode = 'paid' THEN o.indexer_address END),
                       'resolved', (m.indexer_address IS NOT NULL OR o.dispatch_mode = 'paid'),
+                      -- The key that actually signed. One operator can hold several allocations on
+                      -- a deployment, each with its own signing key, so the same NAME can legitimately
+                      -- appear twice with different answers. Without this the page looks broken when
+                      -- it is in fact showing an operator contradicting itself - which is a stronger
+                      -- finding than two operators disagreeing, not a weaker one.
+                      'signing_key', o.indexer_address,
                       'response_cid', o.response_cid,
                       'attestation', o.attestation
                   ) ORDER BY o.indexer_address) AS signers,
