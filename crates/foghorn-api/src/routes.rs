@@ -1443,9 +1443,15 @@ pub async fn qos_conflicts(
                   p.block_number,
                   p.dispatched_at,
                   o.request_cid,
+                  -- Identity depends on dispatch mode, for the THIRD time in this codebase. A
+                  -- gateway observation carries the allocation SIGNING KEY and must be resolved via
+                  -- allocation_map; a paid one already carries the indexer, because we chose who to
+                  -- pay. Joining only on the signing key marked ellipfra "unresolved" on a page
+                  -- naming operators, which is the worst place to get an identity wrong.
                   json_agg(json_build_object(
-                      'indexer', COALESCE(m.indexer_address, o.indexer_address),
-                      'resolved', m.indexer_address IS NOT NULL,
+                      'indexer', COALESCE(m.indexer_address,
+                                          CASE WHEN o.dispatch_mode = 'paid' THEN o.indexer_address END),
+                      'resolved', (m.indexer_address IS NOT NULL OR o.dispatch_mode = 'paid'),
                       'response_cid', o.response_cid,
                       'attestation', o.attestation
                   ) ORDER BY o.indexer_address) AS signers,
