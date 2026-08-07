@@ -37,9 +37,26 @@ struct Profile {
 pub async fn run_score_loop(cfg: ScoringConfig, api_key: Option<String>, pool: PgPool) {
     info!(windows = ?cfg.windows, interval = cfg.interval_secs, "Scoring loop starting");
     loop {
-        match run_score_once(&cfg, api_key.as_deref(), &pool).await {
-            Ok(n) => info!(scored = n, "Scoring cycle complete"),
-            Err(e) => warn!(error = %e, "Scoring cycle failed"),
+        // Run each cycle in its own task so a panic cannot end scoring permanently.
+        //
+        // A panic inside a spawned tokio task kills only that task. The process stays up, every
+        // other loop keeps logging, the container looks perfectly healthy - and grades simply stop
+        // being recomputed, forever. That happened on 2026-08-06: one column whose SQL type had
+        // drifted to NUMERIC panicked a `row.get`, and the public grade board sat frozen for twelve
+        // hours behind a process reporting itself fine.
+        //
+        // Awaiting a JoinHandle turns that panic into an `Err` we can log and carry on from. An
+        // error is recoverable and a panic is a bug, but neither is a reason to stop scoring the
+        // network; the staleness alert in `alerter.rs` remains the backstop for a persistent one.
+        let (c, k, p) = (cfg.clone(), api_key.clone(), pool.clone());
+        match tokio::spawn(async move { run_score_once(&c, k.as_deref(), &p).await }).await {
+            Ok(Ok(n)) => info!(scored = n, "Scoring cycle complete"),
+            Ok(Err(e)) => warn!(error = %e, "Scoring cycle failed"),
+            Err(e) => tracing::error!(
+                error = %e,
+                "Scoring cycle PANICKED - continuing anyway. This is a bug; without this the grade \
+                 board would have frozen silently. The panic message is logged just above."
+            ),
         }
         tokio::time::sleep(Duration::from_secs(cfg.interval_secs)).await;
     }
@@ -319,7 +336,8 @@ async fn detect_allocation_issues(pool: &PgPool, cfg: &ScoringConfig) -> Result<
                   probes AS query_count
            FROM (
                SELECT LOWER(indexer_address) AS addr, deployment_id,
-                      SUM(query_count) AS probes, SUM(num_indexer_200_responses) AS ok
+                      SUM(query_count)::bigint AS probes,
+                      SUM(num_indexer_200_responses)::bigint AS ok
                FROM foghorn_qos
                WHERE bucket_start >= NOW() - ($1 || ' days')::interval
                GROUP BY 1, 2
@@ -333,10 +351,19 @@ async fn detect_allocation_issues(pool: &PgPool, cfg: &ScoringConfig) -> Result<
     .await?;
     let mut by_indexer: HashMap<String, Vec<(String, f64, i64)>> = HashMap::new();
     for row in &errs {
-        by_indexer
-            .entry(row.get("indexer_address"))
-            .or_default()
-            .push((row.get("deployment_id"), row.get("success_rate"), row.get("query_count")));
+        // `try_get`, not `get`. `get` unwraps internally, so a single column whose SQL type drifts
+        // takes down the entire scoring task - which is exactly what happened here. A row we cannot
+        // decode is worth skipping and logging; it is not worth the grade board.
+        let (Ok(indexer), Ok(deployment), Ok(rate), Ok(count)) = (
+            row.try_get::<String, _>("indexer_address"),
+            row.try_get::<String, _>("deployment_id"),
+            row.try_get::<f64, _>("success_rate"),
+            row.try_get::<i64, _>("query_count"),
+        ) else {
+            warn!("skipping an allocation-issue row that would not decode");
+            continue;
+        };
+        by_indexer.entry(indexer).or_default().push((deployment, rate, count));
     }
     for (indexer, deps) in by_indexer {
         if deps.len() >= ROLLUP_THRESHOLD {
@@ -385,7 +412,7 @@ async fn detect_allocation_issues(pool: &PgPool, cfg: &ScoringConfig) -> Result<
         r#"WITH recent AS (
                SELECT LOWER(indexer_address) AS addr, deployment_id,
                       AVG(avg_indexer_blocks_behind) AS blocks_behind,
-                      SUM(query_count) AS probes
+                      SUM(query_count)::bigint AS probes
                FROM foghorn_qos
                WHERE bucket_start >= NOW() - ($2 || ' days')::interval
                  AND avg_indexer_blocks_behind IS NOT NULL
