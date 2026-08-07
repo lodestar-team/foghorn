@@ -392,8 +392,8 @@ async fn store_results(
 
     for obs in observations {
         sqlx::query(
-            "INSERT INTO observation (probe_id, indexer_address, response_hash, latency_ms, meta_block_number, meta_block_hash, http_status, error_class, stake_weight, dispatch_mode)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            "INSERT INTO observation (probe_id, indexer_address, response_hash, latency_ms, meta_block_number, meta_block_hash, http_status, error_class, stake_weight, dispatch_mode, request_cid, response_cid, attestation)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, CAST($13 AS jsonb))
              ON CONFLICT (probe_id, indexer_address) DO NOTHING",
         )
         .bind(probe_id)
@@ -406,6 +406,9 @@ async fn store_results(
         .bind(&obs.error_class)
         .bind(obs.stake_weight)
         .bind(&obs.dispatch_mode)
+        .bind(&obs.request_cid)
+        .bind(&obs.response_cid)
+        .bind(&obs.attestation)
         .execute(pool)
         .await?;
     }
@@ -527,6 +530,9 @@ mod dedup_tests {
             error_class: err.map(str::to_string),
             stake_weight: 1.0,
             dispatch_mode: DISPATCH_PAID.to_string(),
+            request_cid: None,
+            response_cid: None,
+            attestation: None,
         }
     }
 

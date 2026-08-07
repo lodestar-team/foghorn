@@ -1405,6 +1405,105 @@ pub async fn qos_fees(
     })))
 }
 
+/// Divergences that are DISPUTABLE, not merely observed.
+///
+/// The rest of this oracle clusters responses by a JCS-canonicalised hash we compute ourselves.
+/// That is the better detector - it sees through incidental byte differences and catches genuine
+/// semantic disagreement - but it proves nothing to anyone else. It is our opinion about their data.
+///
+/// An attestation is different. The indexer signs `(requestCID, responseCID, subgraphDeploymentID)`
+/// with its allocation key, and the DisputeManager's conflict test is exactly:
+///
+///     requestCID == requestCID && subgraphDeploymentID == subgraphDeploymentID
+///       && responseCID != responseCID
+///
+/// So two indexers that answered the identical probe and signed different `responseCID`s form a
+/// conflicting-attestation dispute, which a fisherman can file with **no deposit** and which can end
+/// in a slash. This endpoint returns exactly those cases, with both signed attestations attached, so
+/// the claim can be checked by someone who does not trust us.
+///
+/// Deliberately narrow. It does not return everything our clustering flagged - only what carries
+/// signatures on both sides. An accusation is worth exactly as much as the evidence behind it.
+pub async fn qos_conflicts(
+    State(state): State<AppState>,
+    Query(params): Query<QosFeesParams>,
+) -> Result<Json<Value>, StatusCode> {
+    let days: i32 = params.days.unwrap_or(7).clamp(1, 90);
+    let limit: i64 = params.limit.unwrap_or(100).clamp(1, 500);
+
+    let rows = sqlx::query(
+        r#"SELECT a.probe_id,
+                  p.deployment_id,
+                  p.block_number,
+                  p.dispatched_at,
+                  a.request_cid,
+                  am.indexer_address  AS indexer_a,
+                  a.response_cid      AS response_cid_a,
+                  a.attestation       AS attestation_a,
+                  bm.indexer_address  AS indexer_b,
+                  b.response_cid      AS response_cid_b,
+                  b.attestation       AS attestation_b
+           FROM observation a
+           JOIN observation b
+             ON b.probe_id = a.probe_id
+            AND b.response_cid IS NOT NULL
+            -- Same request, different answer. Ordered so each pair appears once rather than twice.
+            AND b.response_cid <> a.response_cid
+            AND b.indexer_address > a.indexer_address
+           JOIN probe p ON p.id = a.probe_id
+           LEFT JOIN allocation_map am ON am.allocation_key = a.indexer_address
+           LEFT JOIN allocation_map bm ON bm.allocation_key = b.indexer_address
+           WHERE a.response_cid IS NOT NULL
+             AND a.request_cid = b.request_cid
+             AND p.dispatched_at >= NOW() - make_interval(days => $1)
+           ORDER BY p.dispatched_at DESC
+           LIMIT $2"#,
+    )
+    .bind(days)
+    .bind(limit)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let conflicts: Vec<Value> = rows
+        .iter()
+        .map(|r| {
+            json!({
+                "probe_id": r.get::<uuid::Uuid, _>("probe_id").to_string(),
+                "deployment_id": r.get::<String, _>("deployment_id"),
+                "block_number": r.get::<Option<i64>, _>("block_number"),
+                "observed_at": r
+                    .get::<chrono::DateTime<chrono::Utc>, _>("dispatched_at")
+                    .to_rfc3339(),
+                "request_cid": r.get::<Option<String>, _>("request_cid"),
+                "a": {
+                    "indexer": r.get::<Option<String>, _>("indexer_a"),
+                    "response_cid": r.get::<Option<String>, _>("response_cid_a"),
+                    "attestation": r.get::<Option<Value>, _>("attestation_a"),
+                },
+                "b": {
+                    "indexer": r.get::<Option<String>, _>("indexer_b"),
+                    "response_cid": r.get::<Option<String>, _>("response_cid_b"),
+                    "attestation": r.get::<Option<Value>, _>("attestation_b"),
+                },
+            })
+        })
+        .collect();
+
+    Ok(Json(json!({
+        "window_days": days,
+        "count": conflicts.len(),
+        "means": "Two indexers signed different responseCIDs for the identical request on the same \
+                  deployment. Under DisputeManager this is a conflicting-attestation dispute, \
+                  filable with no deposit.",
+        "not_a_verdict": "A conflict says the two disagreed, not which one is wrong. Resolving that \
+                          is the arbitrator's job, and we are not it.",
+        "how_to_check": "Recover the signer from each attestation; it is the allocation id, and the \
+                         chain maps it to the indexer. Nothing here needs to be taken on our word.",
+        "conflicts": conflicts,
+    })))
+}
+
 #[derive(Debug, Deserialize)]
 pub struct QosCompareParams {
     pub days: Option<i32>,

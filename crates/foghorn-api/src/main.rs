@@ -75,6 +75,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/qos/buckets", get(routes::qos_buckets))
         .route("/v1/qos/compare", get(routes::qos_compare))
         .route("/v1/qos/fees", get(routes::qos_fees))
+        .route("/v1/qos/conflicts", get(routes::qos_conflicts))
         // Oracle-compatible GraphQL. POST is the endpoint a consumer repoints at us; GET serves
         // a playground so "does this really answer my existing query?" is answerable in a browser
         // before anyone edits a config.

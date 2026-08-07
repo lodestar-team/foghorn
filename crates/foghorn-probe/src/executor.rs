@@ -68,6 +68,17 @@ pub struct RawObservation {
     pub http_status: Option<i32>,
     pub error_class: Option<String>,
     pub stake_weight: f64,
+    /// The attestation's own hashes, when the indexer signed one.
+    ///
+    /// `response_hash` above is OUR clustering hash (JCS-canonicalised SHA-256) and is the better
+    /// detector: it sees through incidental byte differences. These are keccak256 over the RAW
+    /// bytes, signed by the allocation key, and they are what makes a disagreement PROVABLE - the
+    /// DisputeManager's conflict test compares exactly these fields. Kept side by side because they
+    /// answer different questions: did the data differ, and can we show it.
+    pub request_cid: Option<String>,
+    pub response_cid: Option<String>,
+    /// The raw signed attestation, so a conflict can be filed without re-probing.
+    pub attestation: Option<String>,
     /// How this observation was obtained: `"paid"` (direct, TAP receipt, we chose the indexer) or
     /// `"gateway"` (routed by Edge & Node's gateway, which chooses for us).
     ///
@@ -144,6 +155,9 @@ pub async fn execute_gateway_probe(req: GatewayProbeRequest) -> RawObservation {
             error_class: Some("http_error".to_string()),
             stake_weight: 1.0,
             dispatch_mode: DISPATCH_GATEWAY.to_string(),
+            request_cid: None,
+            response_cid: None,
+            attestation: None,
         };
     }
 
@@ -182,6 +196,9 @@ pub async fn execute_gateway_probe(req: GatewayProbeRequest) -> RawObservation {
         None
     };
 
+    // Only from a header whose signature recovers; an unverifiable attestation is not evidence.
+    let cids = attestation_header.as_deref().and_then(attestation_cids);
+
     debug!(
         indexer = %indexer_address,
         hash = ?response_hash,
@@ -200,6 +217,11 @@ pub async fn execute_gateway_probe(req: GatewayProbeRequest) -> RawObservation {
         error_class,
         stake_weight: 1.0,
         dispatch_mode: DISPATCH_GATEWAY.to_string(),
+        // Evidence, kept separately from `response_hash`. These are the hashes the indexer SIGNED,
+        // so a disagreement between two of them is disputable rather than merely observed.
+        request_cid: cids.as_ref().map(|(rq, _)| rq.clone()),
+        response_cid: cids.as_ref().map(|(_, rs)| rs.clone()),
+        attestation: attestation_header.clone(),
     }
 }
 
@@ -210,6 +232,20 @@ fn parse_attestation_address(header: &str) -> String {
         return "gateway-bad-attestation".to_string();
     };
     try_recover_signer(&v).unwrap_or_else(|| "gateway-unresolved".to_string())
+}
+
+/// The signed hashes out of an attestation, for evidence rather than for verification.
+///
+/// Only returned when the signature actually recovers. An attestation we cannot verify is not
+/// evidence of anything, and storing its CIDs would invite someone to file a dispute on a forgery.
+pub fn attestation_cids(header: &str) -> Option<(String, String)> {
+    let v: serde_json::Value = serde_json::from_str(header).ok()?;
+    try_recover_signer(&v)?;
+    let cid = |k: &str| -> Option<String> {
+        let s = v[k].as_str()?;
+        (s.trim_start_matches("0x").len() == 64).then(|| s.to_string())
+    };
+    Some((cid("requestCID")?, cid("responseCID")?))
 }
 
 fn try_recover_signer(v: &serde_json::Value) -> Option<String> {
@@ -318,6 +354,9 @@ pub async fn execute_probe(req: ProbeRequest) -> RawObservation {
             error_class: Some("http_error".to_string()),
             stake_weight: req.stake_weight,
             dispatch_mode: DISPATCH_PAID.to_string(),
+            request_cid: None,
+            response_cid: None,
+            attestation: None,
         };
     }
 
@@ -335,6 +374,9 @@ pub async fn execute_probe(req: ProbeRequest) -> RawObservation {
                 error_class: Some("body_error".to_string()),
                 stake_weight: req.stake_weight,
                 dispatch_mode: DISPATCH_PAID.to_string(),
+                request_cid: None,
+                response_cid: None,
+                attestation: None,
             };
         }
         Ok(t) => t,
@@ -381,6 +423,9 @@ pub async fn execute_probe(req: ProbeRequest) -> RawObservation {
         error_class,
         stake_weight: req.stake_weight,
         dispatch_mode: DISPATCH_PAID.to_string(),
+        request_cid: None,
+        response_cid: None,
+        attestation: None,
     }
 }
 
@@ -396,6 +441,9 @@ fn gateway_error_observation(class: &str) -> RawObservation {
         error_class: Some(class.to_string()),
         stake_weight: 1.0,
         dispatch_mode: DISPATCH_GATEWAY.to_string(),
+        request_cid: None,
+        response_cid: None,
+        attestation: None,
     }
 }
 
@@ -411,6 +459,9 @@ fn error_observation(addr: String, stake_weight: f64, latency_ms: Option<i32>, c
         error_class: Some(class.to_string()),
         stake_weight,
         dispatch_mode: DISPATCH_PAID.to_string(),
+        request_cid: None,
+        response_cid: None,
+        attestation: None,
     }
 }
 
@@ -689,23 +740,30 @@ pub async fn execute_paid_probe(
             error_class: Some("http_error".to_string()),
             stake_weight: req.stake_weight,
             dispatch_mode: DISPATCH_PAID.to_string(),
+            request_cid: None,
+            response_cid: None,
+            attestation: None,
         };
     }
 
     // A paid response wraps the payload alongside a signed attestation. The GraphQL body is a
     // string field, so it is parsed out before hashing — hashing the envelope would make every
     // indexer look divergent, since attestations differ per indexer by construction.
-    let (payload, attestation_present) = match serde_json::from_str::<serde_json::Value>(&resp.body) {
+    let (payload, attestation_json) = match serde_json::from_str::<serde_json::Value>(&resp.body) {
         Ok(v) => {
             let inner = v
                 .get("graphQLResponse")
                 .and_then(|s| s.as_str())
                 .map(str::to_string);
-            let att = v.get("attestation").is_some();
+            // On the paid path the attestation is a JSON object in the body, not a header - same
+            // signed fields, different envelope.
+            let att = v.get("attestation").map(|a| a.to_string());
             (inner.unwrap_or(resp.body.clone()), att)
         }
-        Err(_) => (resp.body.clone(), false),
+        Err(_) => (resp.body.clone(), None),
     };
+    let attestation_present = attestation_json.is_some();
+    let cids = attestation_json.as_deref().and_then(attestation_cids);
     if !attestation_present {
         debug!(indexer = %req.indexer_address, "paid response carried no attestation");
     }
@@ -751,5 +809,10 @@ pub async fn execute_paid_probe(
         error_class,
         stake_weight: req.stake_weight,
         dispatch_mode: DISPATCH_PAID.to_string(),
+        // See the gateway path: these are the hashes the indexer signed, and they are what turns a
+        // divergence into something a fisherman could file.
+        request_cid: cids.as_ref().map(|(rq, _)| rq.clone()),
+        response_cid: cids.as_ref().map(|(_, rs)| rs.clone()),
+        attestation: attestation_json.clone(),
     }
 }
