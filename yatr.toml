@@ -20,7 +20,7 @@ no_cache = true
 [tasks.fmt-check]
 desc = "Fail if the tree is unformatted"
 run = ["cargo fmt --all -- --check"]
-sources = ["**/*.rs", "rustfmt.toml"]
+sources = ["**/*.rs"]
 
 [tasks.lint]
 desc = "Clippy with warnings denied"
