@@ -53,6 +53,15 @@ struct SqlResponse<T> {
     truncated: bool,
 }
 
+/// `/ready` as the nest answers it. Only the two fields this module judges on are declared.
+#[derive(Debug, Clone, Default, Deserialize)]
+struct ReadyBody {
+    #[serde(default)]
+    ready: bool,
+    #[serde(default)]
+    lag_blocks: Option<u64>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct NestAllocation {
     #[serde(rename = "allocationId")]
@@ -107,13 +116,38 @@ impl NestClient {
         Ok((body.rows, body.provenance))
     }
 
-    /// Chain tip as the nest sees it, versus what it has actually sealed.
-    pub async fn lag_blocks(&self, chain_tip: u64) -> Result<u64> {
-        let (_rows, prov) = self.sql::<serde_json::Value>("SELECT 1").await?;
-        let sealed = prov
-            .sealed_through
-            .context("nest reported no sealed_through — cannot judge how current it is")?;
-        Ok(chain_tip.saturating_sub(sealed))
+    /// How far behind the chain the nest is, **as the nest itself reports it**.
+    ///
+    /// This used to subtract `sealed_through` from the chain tip, and that is a different question.
+    /// `sealed_through` is the last block committed to a sealed segment; a tip-following nest seals
+    /// in windows, so it legitimately trails the block it has actually indexed by hundreds of
+    /// thousands of blocks while being perfectly current. Measured 2026-09-06: `as_of` 502,433,429
+    /// against `sealed_through` 501,993,721, a gap of 439,708 - so every check failed the 10,000
+    /// block limit and the sync fell back to the gateway on every pass, for months, while the nest
+    /// sat at tip.
+    ///
+    /// `/ready` is the nest's own judgement and already carries `lag_blocks`. Asking it beats
+    /// recomputing the answer from a field that means something else.
+    pub async fn lag_blocks(&self, _chain_tip: u64) -> Result<u64> {
+        let url = format!("{}/ready", self.base_url);
+        let mut req = self.http.get(&url);
+        if let Some((u, p)) = &self.basic_auth {
+            req = req.basic_auth(u, Some(p));
+        }
+        let resp = req.send().await.context("nest /ready unreachable")?;
+        let status = resp.status();
+        let body: ReadyBody = resp.json().await.context("nest /ready returned unparseable JSON")?;
+
+        // A 503 from /ready is the nest saying "not ready" rather than a transport failure, and the
+        // body still explains itself, so it is read either way.
+        if !status.is_success() && status.as_u16() != 503 {
+            bail!("nest /ready returned HTTP {}", status.as_u16());
+        }
+        if !body.ready {
+            bail!("nest reports it is not ready");
+        }
+        body.lag_blocks
+            .context("nest /ready carried no lag_blocks - cannot judge how current it is")
     }
 
     /// The active allocation set, or an error if the nest is not current enough to be trusted.
@@ -131,8 +165,13 @@ impl NestClient {
         }
         let (rows, _) = self
             .sql::<NestAllocation>(
-                "SELECT \"allocationId\", \"indexer\", \"subgraphDeploymentId\", tokens \
-                 FROM allocations WHERE status = 'active'",
+                // `lodestar_allocations` is the folded view the allocations nest exposes; there
+                // is no bare `allocations` table, and asking for one is a 400. Status is
+                // capitalised there. Aliased back to the names this struct deserializes, so the
+                // shape the rest of the module sees is unchanged.
+                "SELECT id AS \"allocationId\", indexer, subgraph_deployment AS \"subgraphDeploymentId\", \
+                 CAST(allocated_tokens AS VARCHAR) AS tokens \
+                 FROM lodestar_allocations WHERE status = 'Active'",
             )
             .await?;
         if rows.is_empty() {
@@ -163,7 +202,15 @@ impl NestClient {
     /// blob should not cost us every other operator's endpoint.
     pub async fn endpoints(&self) -> Result<Vec<(String, String)>> {
         let (rows, _) = self
-            .sql::<NestEndpointRow>("SELECT indexer, data FROM service_endpoints")
+            // There is no `service_endpoints` view; the registrations are an event table, and an
+            // indexer may register more than once. Newest per provider, or an endpoint retired
+            // years ago would still be probed.
+            .sql::<NestEndpointRow>(
+                "SELECT indexer, data FROM (\
+                 SELECT LOWER(\"serviceProvider\") AS indexer, data, \
+                 ROW_NUMBER() OVER (PARTITION BY LOWER(\"serviceProvider\") ORDER BY block_number DESC, log_index DESC) AS rn \
+                 FROM subgraph_service__service_provider_registered) WHERE rn = 1",
+            )
             .await?;
         let mut out = Vec::with_capacity(rows.len());
         for r in rows {
@@ -206,7 +253,7 @@ impl NestClient {
         let q = format!(
             "SELECT \"serviceProvider\", \"subgraphDeploymentId\", \"allocationId\", payer, \
              \"tokensCollected\", \"tokensCurators\", block_number, block_timestamp, log_index \
-             FROM service__query_fees_collected \
+             FROM subgraph_service__query_fees_collected \
              WHERE block_number > {since_block} \
              ORDER BY block_number ASC, log_index ASC LIMIT {limit}"
         );
